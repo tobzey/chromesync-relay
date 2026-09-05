@@ -1,0 +1,28 @@
+node_modules/
+*.log
+.DS_Store
+# Never commit local native-host registrations or user config
+companion/*.local.json
+# Cloudflare Workers local/deploy artifacts (real values never belong in git)
+.wrangler
+.wrangler/
+worker/wrangler.local.toml
+.dev.vars
+worker/.dev.vars
+
+# Absolute Node path pinned by companion/install.sh (machine-local)
+companion/node-bin.path
+
+# Private sessions, pairing material and local state
+.chromesync/
+*.invite.json
+*.csync
+.env
+.env.*
+!.env.example
+wrangler.local.jsonc
+*.tgz
+coverage/
+
+# Local publication artifacts; never nest a Git history in the source release
+.release/

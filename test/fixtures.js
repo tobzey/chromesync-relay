@@ -1,0 +1,70 @@
+// Synthetic cookie fixtures ONLY. Dummy domains, fake values, no real logins,
+// no real profile UUIDs, no real API keys. Do not add real data here, ever.
+
+export const syntheticCookies = [
+  {
+    name: "session_id",
+    value: "synthetic-abc123",
+    domain: "example.com",
+    path: "/",
+    secure: true,
+    httpOnly: true,
+    sameSite: "lax",
+    session: false,
+    expirationDate: 4102444800, // 2100-01-01
+  },
+  {
+    name: "pref",
+    value: "dark",
+    domain: ".example.org",
+    path: "/",
+    secure: false,
+    httpOnly: false,
+    sameSite: "no_restriction",
+    session: false,
+    expirationDate: 4102444800,
+  },
+  {
+    name: "tmp",
+    value: "session-only",
+    domain: "test.invalid",
+    path: "/app",
+    secure: false,
+    httpOnly: false,
+    sameSite: "unspecified",
+    session: true,
+  },
+  {
+    name: "__Host-token",
+    value: "hostprefix",
+    domain: "example.com",
+    path: "/",
+    secure: true,
+    httpOnly: true,
+    sameSite: "strict",
+    session: false,
+    expirationDate: 4102444800,
+  },
+  {
+    name: "__Host-bad",
+    value: "violates-rules",
+    domain: ".example.com", // leading dot -> must be skipped for __Host-
+    path: "/",
+    secure: true,
+    httpOnly: true,
+    sameSite: "strict",
+    session: false,
+    expirationDate: 4102444800,
+  },
+  {
+    name: "__Secure-bad",
+    value: "not-secure",
+    domain: "example.com",
+    path: "/",
+    secure: false, // __Secure- requires secure -> must be skipped
+    httpOnly: false,
+    sameSite: "lax",
+    session: false,
+    expirationDate: 4102444800,
+  },
+];

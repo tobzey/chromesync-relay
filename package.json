@@ -1,0 +1,54 @@
+{
+  "name": "chromesync",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Terminal-first encrypted Chrome cookie syncing across devices and named profiles.",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "test:unit": "node --test test/cookies.test.js test/engine.test.js test/browserUse.test.js test/manifest.test.js test/file-drop.test.js test/file-drop-wiring.test.js test/profileUse.test.js test/relay-auth.test.js test/relay-server.test.js test/relay-ratelimit.test.js test/relay-client.test.js test/relay-wiring.test.js test/invite.test.js test/autosync.test.js test/worker-auth.test.js test/worker-relay.test.js test/worker-client.test.js test/cli.test.js test/cdp.test.js test/installer.test.js test/setup.test.js test/terminal.test.js test/restart.test.js",
+    "test:e2e": "node --test test/e2e-localchrome.test.js test/e2e-file-drop.test.js test/e2e-relay.test.js test/e2e-cli.test.js",
+    "test:relay": "node --test test/relay-auth.test.js test/relay-server.test.js test/relay-ratelimit.test.js test/relay-client.test.js test/relay-wiring.test.js test/invite.test.js test/autosync.test.js test/e2e-relay.test.js test/worker-auth.test.js test/worker-relay.test.js test/worker-client.test.js",
+    "test:worker": "node --test test/worker-auth.test.js test/worker-relay.test.js test/worker-client.test.js",
+    "relay:serve": "node server/server.js",
+    "test:load": "node test/load-unpacked.mjs",
+    "deploy": "npx wrangler@4 deploy",
+    "deploy:check": "npx wrangler@4 deploy --dry-run",
+    "start": "node cli/index.js"
+  },
+  "license": "MIT",
+  "bin": {
+    "chromesync": "cli/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tobzey/chromesync-relay.git"
+  },
+  "homepage": "https://github.com/tobzey/chromesync-relay#readme",
+  "bugs": {
+    "url": "https://github.com/tobzey/chromesync-relay/issues"
+  },
+  "author": "Tobias",
+  "files": [
+    "cli/",
+    "companion/*.js",
+    "companion/*.sh",
+    "companion/io.chromesync.host.json",
+    "src/",
+    "options/",
+    "popup/",
+    "manifest.json",
+    "server/",
+    "worker/*.js",
+    "worker/README.md",
+    "wrangler.jsonc",
+    "docs/",
+    "LICENSE",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "install.sh"
+  ]
+}

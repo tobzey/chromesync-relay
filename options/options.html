@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ChromeSync — Extension settings</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <h1>ChromeSync</h1>
+    <section>
+      <h2>Connect this Chrome profile</h2>
+      <p>Choose the source you created in the terminal. Connecting sends this
+        Chrome profile’s cookies to its paired devices. Relay and pairing settings
+        stay in your local terminal configuration.</p>
+      <label>Source profile <select id="terminal_profile"><option value="">Loading…</option></select></label>
+      <button id="terminal_connect" type="button">Connect and sync</button>
+      <button id="terminal_refresh" type="button" class="secondary">Refresh profiles</button>
+      <button id="terminal_disconnect" type="button" class="secondary">Disconnect</button>
+      <p id="terminal_status" class="muted" role="status"></p>
+    </section>
+    <details>
+      <summary>Advanced: legacy extension settings</summary>
+    <p>Optional companion for an existing Chrome profile. For terminal setup, run
+      <code>chromesync setup</code>. Use one source per profile.</p>
+    <p class="muted">Choose where to send this profile’s cookies, then save. A receiving
+      Chrome uses a separate folder. Browser passwords and site storage are not copied.</p>
+
+    <section>
+      <h2>Sync through your relay</h2>
+      <label class="checkbox"><input type="checkbox" id="rel_enabled" /> Enabled</label>
+      <p class="muted">Pushes encrypted cookie files to a small server you run
+        yourself. No shared folder needed. Use the same pairing code on both
+        devices. Share the invite only in a private channel — it contains the
+        pairing code.</p>
+      <label>Sync server address
+        <input type="text" id="rel_relayUrl" placeholder="https://relay.example.com" autocomplete="off" />
+      </label>
+      <label>Pairing code
+        <input type="password" id="rel_pairingSecret" placeholder="generate one, or paste an invite" autocomplete="off" />
+      </label>
+      <p class="muted">A short or common code can be guessed by anyone who runs
+        the sync server. Prefer the generate button unless you have a reason not
+        to.</p>
+      <div class="row">
+        <button type="button" id="rel_generate" class="secondary">Generate a strong pairing code</button>
+        <button type="button" id="rel_copyInvite" class="secondary">Copy invite link</button>
+      </div>
+      <label>Paste invite
+        <input type="text" id="rel_invite" placeholder="csync1.…" autocomplete="off" />
+      </label>
+      <div class="row">
+        <button type="button" id="rel_pasteInvite" class="secondary">Apply invite</button>
+        <span id="rel_inviteStatus" class="muted"></span>
+      </div>
+      <label>This device
+        <select id="rel_mode">
+          <option value="push">Send changes</option>
+          <option value="pull">Receive changes</option>
+          <option value="both">Both</option>
+        </select>
+      </label>
+      <label>Target Chrome folder (receive side)
+        <input type="text" id="rel_userDataDir" placeholder="/path/to/target/user-data-dir" />
+      </label>
+      <label>Remote debugging port (0 = auto)
+        <input type="number" id="rel_port" min="0" value="0" />
+      </label>
+    </section>
+
+    <section>
+      <h2>Schedule</h2>
+      <label>Sync interval (minutes)
+        <input type="number" id="intervalMinutes" min="1" value="45" />
+      </label>
+      <label class="checkbox">
+        <input type="checkbox" id="syncOnChange" checked />
+        Auto-sync when cookies change
+      </label>
+      <p class="muted">Bursts of cookie writes are collapsed into one sync. The
+        extension watches this browser only; received cookies are written into a
+        separate Chrome folder, so they do not bounce back.</p>
+    </section>
+
+    <section>
+      <h2>Cookie domain allowlist</h2>
+      <p class="muted">One domain per line. Empty = sync all domains. Example: example.com</p>
+      <textarea id="allowlist" rows="4" placeholder="example.com&#10;example.org"></textarea>
+    </section>
+
+    <details>
+      <summary>Optional: send to another local Chrome</summary>
+      <label class="checkbox"><input type="checkbox" id="lc_enabled" /> Enabled</label>
+      <label>Target Chrome user-data-dir
+        <input type="text" id="lc_userDataDir" placeholder="/path/to/target/user-data-dir" />
+      </label>
+      <label>Remote debugging port (0 = auto)
+        <input type="number" id="lc_port" min="0" value="0" />
+      </label>
+    </details>
+
+    <details>
+      <summary>Optional: encrypted shared folder</summary>
+      <label class="checkbox"><input type="checkbox" id="fd_enabled" /> Enabled</label>
+      <p class="muted">Writes an AEAD-encrypted blob into a folder you sync yourself
+        (Syncthing, iCloud Drive, …). Required: drop folder + the same pairing secret
+        on both machines. The secret is never hardcoded and never logged.
+        A random non-identifying host id and replay counters are generated and stored
+        in the companion’s local app-state directory (<code>~/.chromesync</code>) on
+        first use — not in the drop folder, never cookies.</p>
+      <label>Shared drop folder
+        <input type="text" id="fd_dropDir" placeholder="/path/to/shared/folder" />
+      </label>
+      <label>Pairing secret
+        <input type="password" id="fd_pairingSecret" placeholder="(never committed)" autocomplete="off" />
+      </label>
+      <label>Source host id (optional; blank = generated once and persisted locally)
+        <input type="text" id="fd_sourceHostId" placeholder="leave blank" />
+      </label>
+      <label>Companion state path (optional; blank = ~/.chromesync/drop-state.json)
+        <input type="text" id="fd_statePath" placeholder="leave blank for default" />
+      </label>
+    </details>
+
+    <details>
+      <summary>Experimental: Browser Use Cloud</summary>
+      <p class="muted">Unverified integration for contributors. Not needed for ChromeSync or local agent access.</p>
+      <div>
+      <h2>Storage</h2>
+      <label class="checkbox">
+        <input type="checkbox" id="persistLocal" />
+        Persist full config (incl. Browser Use API key) to disk — relay pairing is always saved locally
+      </label>
+      <p class="muted">Default is session-only (chrome.storage.session): the API key is
+        cleared when the browser restarts. Enabling this writes it to disk under your
+        browser profile.</p>
+      </div>
+      <label class="checkbox"><input type="checkbox" id="bu_enabled" /> Enabled</label>
+      <label>API base URL
+        <input type="text" id="bu_baseUrl" placeholder="https://api.browser-use.com/api/v3" />
+      </label>
+      <label>API key
+        <input type="password" id="bu_apiKey" placeholder="(never committed)" autocomplete="off" />
+      </label>
+      <label>Profile ID
+        <input type="text" id="bu_profileId" placeholder="your-profile-id" />
+      </label>
+      <label>profile-use Chrome user-data-dir (optional CLI wrap)
+        <input type="text" id="bu_profileUseDir" placeholder="/absolute/path/to/chrome-profile" />
+      </label>
+      <p class="muted">When set, the companion shells out to <code>profile-use sync</code>
+        (requires <code>profile-use</code> ≥ 1.0.5 on PATH and <code>BROWSER_USE_API_KEY</code>
+        in the companion environment). The collected cookie array is not sent to the CLI.</p>
+    </details>
+
+    <button id="save">Save settings</button>
+    <span id="saved" class="muted"></span>
+
+    </details>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ChromeSync</title>
+    <style>
+      body { font: 13px system-ui, sans-serif; width: 280px; margin: 0; padding: 12px; }
+      h1 { font-size: 14px; margin: 0 0 8px; }
+      button { font: inherit; padding: 6px 12px; cursor: pointer; }
+      .status { margin-top: 10px; white-space: pre-wrap; color: #333; }
+      .muted { color: #777; }
+      a { font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>ChromeSync</h1>
+    <p class="muted">Send sessions from this profile.</p>
+    <button id="syncNow">Sync now</button>
+    <div id="status" class="status muted">Loading…</div>
+    <p><a href="#" id="openOptions">Extension settings</a></p>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

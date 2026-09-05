@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "ChromeSync",
+  "version": "0.2.0",
+  "description": "Optional ChromeSync companion: send cookies from this Chrome profile to your other browsers.",
+  "permissions": [
+    "cookies",
+    "alarms",
+    "storage",
+    "nativeMessaging",
+    "idle"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "options_page": "options/options.html",
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "ChromeSync"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3m7006uCET2ozhV1q7hNeWsc4kn+QLWDlZf53ChblM8MLgM1V6MIJLKvSnd3kJP+1S2fwcuGlmJuUZ9AeX88fNVK0dMgaqi6h9PrfwF3uAp9W8+aG+F8Jl6WQfkAqj4KQZuiGGrUOeD3lVbviKkxbdou81oQPhlD8PG2QkR/w4b+oGTSQ2zYvIJwpGX64EOsW8lchG1uTj1p+fhdmYeTYdVTDp3Hlq2HVukkTIqUOO1fmlW1mErpMKRLJwVR/ks6YdZDtQPSdIJSMBvd3AjMiizN3IwsJPVM8js9J9+MmC9qV7xLxdht16/7ROEPlE0UzvC/gEj2Oorz4xrtulmTXQIDAQAB",
+  "minimum_chrome_version": "130"
+}
