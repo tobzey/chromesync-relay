@@ -25,8 +25,14 @@ async function until(check, label) {
 }
 
 async function page(browser, url) {
-  const { targetInfos } = await browser.connection.send('Target.getTargets');
-  const target = targetInfos.find(item => item.type === 'page');
+  // A responsive browser CDP pipe does not mean its startup page exists yet.
+  // Attach only after Chrome has published that target, within the usual bound.
+  let target;
+  await until(async () => {
+    const { targetInfos } = await browser.connection.send('Target.getTargets');
+    target = targetInfos.find(item => item.type === 'page');
+    return !!target;
+  }, 'Chrome startup page target');
   const { sessionId } = await browser.connection.send('Target.attachToTarget', { targetId: target.targetId, flatten: true });
   await browser.connection.send('Page.enable', {}, sessionId);
   await browser.connection.send('Page.navigate', { url }, sessionId);

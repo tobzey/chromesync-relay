@@ -3,6 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdtemp, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -31,11 +32,17 @@ test('owner-only runtime takeover completes original unknown request and device 
     const code = 'SYNTHETIC_PHONE_CODE_829145';
     const cookie = 'SYNTHETIC_TAKEOVER_SESSION';
     const accountIdentity = 'synthetic-takeover-account-id';
+    const readyPath = `/verification-ready-${randomUUID()}`;
+    let markPageReady;
+    const pageReady = new Promise(resolve => { markPageReady = resolve; });
     let completions=0;
     const fixture = createServer(async (req,res)=>{
       const url=new URL(req.url,'http://localhost');
       res.setHeader('Cache-Control','no-store');
       const html=body=>{res.setHeader('Content-Type','text/html');res.end(`<!doctype html><title>Owner verification fixture</title>${body}`);};
+      if (url.pathname===readyPath && req.method==='POST' && completions===1 && req.headers.cookie?.includes(`takeover_fixture=${cookie}`)) {
+        res.writeHead(204);res.end();markPageReady();return;
+      }
       if (url.pathname==='/manual') {
         res.setHeader('Set-Cookie',`takeover_fixture=${cookie}; HttpOnly; SameSite=Strict; Path=/`);
         return html('<h1>Enter the phone code</h1><form method="post" action="/verify"><input name="code" autocomplete="one-time-code" aria-label="Phone code" style="position:absolute;left:20px;top:80px;width:220px;height:30px"><button style="position:absolute;left:20px;top:140px;width:200px;height:30px">Verify</button></form>');
@@ -44,7 +51,8 @@ test('owner-only runtime takeover completes original unknown request and device 
         let body='';for await (const part of req) body+=part;
         if (new URLSearchParams(body).get('code')===code && req.headers.cookie?.includes(`takeover_fixture=${cookie}`)) {
           completions++;
-          return html(`<h1 id="account">Verification complete</h1><p id="account-identity">${accountIdentity}</p><p>Literal echo ${code}</p>`);
+          return html(`<h1 id="account">Verification complete</h1><p id="account-identity">${accountIdentity}</p><p>Literal echo ${code}</p>
+            <script>addEventListener('load',()=>requestAnimationFrame(()=>requestAnimationFrame(()=>fetch(${JSON.stringify(readyPath)},{method:'POST',credentials:'same-origin'}))),{once:true});</script>`);
         }
         res.writeHead(303,{Location:'/manual'});return res.end();
       }
@@ -65,8 +73,16 @@ test('owner-only runtime takeover completes original unknown request and device 
     await updateAuthSecrets(home,secrets=>{secrets.peers=roles.map(role=>({identity:publicIdentity(identities[role]),channel:channels[role],enabled:true}));});
     const executorIdentity=loadAuthSecrets(home).identity;
     const controller=createBrowserController({chromePath:process.env.CHROMESYNC_TEST_CHROME,profileRoot:path.join(root,'browsers'),services:[],testing:{allowLoopbackHttp:true}});
+    const observationErrors=[];
+    const runtimeController={...controller,async takeoverObserve(id){
+      try{return await controller.takeoverObserve(id);}
+      catch(error){
+        observationErrors.push(typeof error.code==='string' && /^[A-Z_]{1,64}$/.test(error.code)?error.code:'UNKNOWN_BROWSER_ERROR');
+        throw error;
+      }
+    }};
     let providerCalls=0;
-    const runtime=await createAuthExecutor({home,controller,providers:{onepassword:{async useFactors(){providerCalls++;throw new Error('Synthetic provider should not run for manual takeover');}}}});
+    const runtime=await createAuthExecutor({home,controller:runtimeController,providers:{onepassword:{async useFactors(){providerCalls++;throw new Error('Synthetic provider should not run for manual takeover');}}}});
     let polling=true;
     const loop=(async()=>{while(polling){await runtime.poll();await delay(15);}})();
     const callers=Object.fromEntries(roles.map(role=>[role,createRelayCaller({identity:identities[role],
@@ -114,16 +130,29 @@ test('owner-only runtime takeover completes original unknown request and device 
       assert.equal(image.format,'jpeg');
       assert.equal(image.origin,origin);
       assert.ok(Buffer.from(image.image,'base64').length<=80*1024);
-      await owner('takeover.click',{takeoverId:takeover.takeoverId,x:40,y:95});
-      await owner('takeover.type',{takeoverId:takeover.takeoverId,text:code});
-      await owner('takeover.key',{takeoverId:takeover.takeoverId,key:'Enter'});
-      let verified;
+      assert.deepEqual(await owner('takeover.click',{takeoverId:takeover.takeoverId,x:40,y:95}),{status:'ok'});
+      assert.deepEqual(await owner('takeover.type',{takeoverId:takeover.takeoverId,text:code}),{status:'ok'});
+      assert.deepEqual(await owner('takeover.key',{takeoverId:takeover.takeoverId,key:'Enter'}),{status:'ok'});
+      // Wait for this successful document to paint before requesting its image.
+      // The original cookie session must supply the signal; never resubmit the
+      // sensitive action when navigation or a screenshot has not settled yet.
+      let readinessTimer;
+      try {
+        const ready=await Promise.race([pageReady.then(()=>true),new Promise(resolve=>{readinessTimer=setTimeout(()=>resolve(false),10000);})]);
+        assert.equal(ready,true,`Success document did not become ready; submissions=${completions}; browserErrors=${observationErrors.join(',')}`);
+      } finally {clearTimeout(readinessTimer);}
+      let verified,lastObservation='not-attempted';
       const deadline=Date.now()+5000;
       while(Date.now()<deadline){
-        try{verified=await owner('takeover.observe',{takeoverId:takeover.takeoverId});if(verified.purpose==='authenticated')break;}catch{}
+        try{
+          verified=await owner('takeover.observe',{takeoverId:takeover.takeoverId});
+          lastObservation=['authenticated','unknown','login','reauthentication'].includes(verified?.purpose)?verified.purpose:
+            ['uncertain','failed'].includes(verified?.status)?verified.status:'unexpected-response';
+          if(verified?.purpose==='authenticated')break;
+        }catch{lastObservation='rejected';}
         await delay(30);
       }
-      assert.equal(verified?.purpose,'authenticated');
+      assert.equal(verified?.purpose,'authenticated',`Success observation=${lastObservation}; submissions=${completions}; browserErrors=${observationErrors.join(',')}`);
       assert.equal(completions,1,'the owner submits the original browser cookie session');
       assert.deepEqual(await owner('takeover.finish',{takeoverId:takeover.takeoverId}),{status:'authenticated',completedRequests:1});
       assert.equal((await agent('auth.status',{requestId:request.requestId})).status,'succeeded');
