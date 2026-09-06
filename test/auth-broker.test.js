@@ -1073,3 +1073,63 @@ test('pending summary caps entries and encoded bytes independently of pagination
   assert(second.pendingSummary.length > 0 && second.pendingSummary.length < 20);
   assert(Buffer.byteLength(JSON.stringify(second.pendingSummary)) <= 8192);
 });
+
+for (const expireFirst of [false, true]) test(`persistent execution outage recovers unused approval after grant expiry (expireFirst=${expireFirst})`, async t => {
+  const f = await fixture(t); const request = await f.request();
+  let unavailable = false, failures = 0, failCommit = false;
+  const store = { read: () => f.store.read(), mutate: async fn => {
+    if (unavailable) { failures++; throw new AuthStoreError('Synthetic store outage'); }
+    const result = await f.store.mutate(state => {
+      const result = fn(state);
+      if (failCommit) throw new Error('Synthetic durable write failure');
+      return result;
+    });
+    if (result?.status === 'approved') unavailable = true;
+    return result;
+  } };
+  const broker = createBroker({ ...f.configuration, store });
+  const approved = await broker.decide(request.requestId, { decision: 'once' }, 'owner-1');
+  assert.equal(approved.status, 'approved'); assert.equal(approved.diagnostic.code, 'STORE_UNAVAILABLE');
+  assert.equal(failures, 4); assert.equal(f.calls.sink, 0);
+  const stored = (await f.store.read()).requests[0];
+  assert.equal(stored.diagnostic, undefined); assert.equal(stored.grant.consumedAt, undefined);
+  unavailable = false; f.advance(120001);
+  // A callback that applies the diagnostic but cannot commit must not lose it.
+  failCommit = true;
+  await assert.rejects(broker.get(request.requestId, 'agent-1'), AuthStoreError);
+  assert.equal((await f.store.read()).requests[0].diagnostic, undefined);
+  failCommit = false;
+  if (expireFirst) {
+    const expired = await broker.get(request.requestId, 'agent-1');
+    assert.equal(expired.status, 'expired'); assert.equal(expired.diagnostic.code, 'STORE_UNAVAILABLE');
+  }
+  const retry = await broker.retryRequest(request.requestId, 'owner-1');
+  assert.equal(retry.status, 'pending'); assert.notEqual(retry.requestId, request.requestId);
+  const state = await f.store.read();
+  const old = state.requests.find(row => row.id === request.requestId), fresh = state.requests.find(row => row.id === retry.requestId);
+  assert.equal(old.supersededBy, fresh.id); assert.equal(fresh.supersedes, old.id); assert.equal(fresh.grant, undefined);
+  assert.equal((await broker.get(old.id, 'agent-1')).diagnostic.code, 'STORE_UNAVAILABLE');
+  assert(state.audit.some(row => row.requestId === old.id && row.event === 'expired' && row.diagnostic?.code === 'STORE_UNAVAILABLE'));
+  assert(state.audit.some(row => row.requestId === old.id && row.event === 'retry-prepared'));
+  assert.equal(f.calls.sink, 0);
+});
+
+test('expired unused grants remain retryable after restart without an in-memory diagnostic', async t => {
+  const f = await fixture(t); await f.request();
+  await f.store.mutate(state => {
+    const row = state.requests[0]; row.status = 'expired'; row.reason = 'request-expired';
+    row.grant = { factors: row.factors, purposes: ['login'], issuedAt: 1, expiresAt: 2, approverId: 'owner-1' };
+  });
+  const broker = createBroker(f.configuration);
+  const row = (await f.store.read()).requests[0];
+  assert.equal((await broker.retryRequest(row.id, 'owner-1')).status, 'pending');
+});
+
+for (const consumed of [false, true]) test(`expired ${consumed ? 'consumed' : 'never-approved'} requests cannot gain a retry grant`, async t => {
+  const f = await fixture(t); const request = await f.request();
+  await f.store.mutate(state => {
+    const row = state.requests[0]; row.status = 'expired';
+    if (consumed) row.grant = { issuedAt: 1, expiresAt: 2, consumedAt: 1 };
+  });
+  assert.equal((await f.broker.retryRequest(request.requestId, 'owner-1')).reason, 'request-not-retryable');
+});

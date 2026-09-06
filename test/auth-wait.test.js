@@ -39,7 +39,7 @@ test('wait CLI follows state changes and returns timedOut without an error on de
   assert.equal((await waitForAuth(remote, 'synthetic', { timeoutSeconds: 0, now: () => time })).timedOut, true);
 });
 
-test('the CLI overall deadline returns the last state when a relay hop is still pending', async () => {
+test('the CLI transport deadline returns the last state when a relay hop is still pending', async () => {
   const remote = { async call(operation, _args, options) {
     if (operation === 'auth.status') return { requestId: 'synthetic', status: 'pending' };
     return new Promise(resolve => {
@@ -48,15 +48,35 @@ test('the CLI overall deadline returns the last state when a relay hop is still 
       if (options.signal.aborted) stop();
     });
   } };
-  const result = await waitForAuth(remote, 'synthetic', { timeoutSeconds: 0.03 });
+  // Abort represents transport exhaustion; keep this test deterministic and fast.
+  const nativeSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms) => { assert.equal(ms, 11000); return nativeSetTimeout(fn, 1); };
+  let result;
+  try { result = await waitForAuth(remote, 'synthetic', { timeoutSeconds: 0.03 }); }
+  finally { globalThis.setTimeout = nativeSetTimeout; }
   assert.deepEqual(result, { requestId: 'synthetic', status: 'pending', timedOut: true });
 });
 
-for (const [remaining, hop] of [[30000, 20000], [65000, 55000], [300000, 60000]]) test(`wait reserves transport margin with ${remaining}ms remaining`, async () => {
+for (const [remaining, expected] of [[30000, [30000]], [65000, [60000, 5000]], [300000, [60000, 60000, 60000, 60000, 60000]]]) test(`undecided wait uses full hops for ${remaining}ms`, async () => {
+  let time = 0; const hops = [];
   const remote = { async call(operation, args, options) {
     if (operation === 'auth.status') return { status: 'pending' };
-    assert.equal(args.timeoutMs, hop); assert.equal(options.timeoutMs, hop + 10000);
-    return { status: 'succeeded' };
+    hops.push(args.timeoutMs); assert.equal(options.timeoutMs, args.timeoutMs + 10000);
+    time += args.timeoutMs;
+    return { status: 'pending', timedOut: true };
   } };
-  await waitForAuth(remote, 'synthetic', { timeoutSeconds: remaining / 1000, now: () => 0 });
+  const result = await waitForAuth(remote, 'synthetic', { timeoutSeconds: remaining / 1000, now: () => time });
+  assert.deepEqual(hops, expected); assert.equal(time, remaining);
+  assert.deepEqual(result, { status: 'pending', timedOut: true });
+});
+
+test('a timed-out hop with 800ms remaining does not issue another call', async () => {
+  let time = 0, hops = 0;
+  const remote = { async call(operation, args) {
+    if (operation === 'auth.status') return { status: 'pending' };
+    hops++; assert.equal(args.timeoutMs, 30000); time = 29200;
+    return { status: 'pending', timedOut: true };
+  } };
+  assert.equal((await waitForAuth(remote, 'synthetic', { timeoutSeconds: 30, now: () => time })).timedOut, true);
+  assert.equal(hops, 1);
 });

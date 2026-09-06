@@ -11,7 +11,8 @@ const OPEN = new Set(['pending', 'approved', 'authenticating', 'needs-user']);
 const RETRYABLE = new Set(['needs-user', 'failed']);
 const REQUEST_TTL = 5 * 60_000;
 const GRANT_TTL = 120_000;
-const retryable = (row, time) => RETRYABLE.has(row.status) || ((row.status === 'approved' || (row.status === 'expired' && row.diagnostic?.code === 'STORE_UNAVAILABLE')) && row.grant?.expiresAt <= time);
+const unusedApproval = row => ['approved', 'expired'].includes(row.status) && row.grant && row.grant.consumedAt == null;
+const retryable = (row, time) => RETRYABLE.has(row.status) || (unusedApproval(row) && row.grant.expiresAt <= time);
 const TERMINAL_RETENTION = 30 * 24 * 60 * 60_000;
 const MIN_TERMINAL_RETENTION = 15 * 60_000;
 const MAX_REQUESTS = 5000;
@@ -186,15 +187,24 @@ export function createBroker({ store, controller, providers, now = Date.now, exe
   const waiters = new Map();
   const requesterWaits = new Map();
   let waitCount = 0, waitsClosing = false, transitions;
+  const pendingDiagnostics = new Map();
   const backingStore = store;
   store = {
     read: (...args) => backingStore.read(...args),
     async mutate(operation) {
-      const changes = [];
+      const changes = [], appliedDiagnostics = [];
       const result = await backingStore.mutate(state => {
+        // Keep pending entries until this transaction commits, including when
+        // the operation or the final durable write fails after this callback.
+        for (const [id, diagnostic] of pendingDiagnostics) {
+          const row = state.requests.find(row => row.id === id);
+          if (row && unusedApproval(row)) row.diagnostic = { ...diagnostic, credentialsSupplied: false };
+          appliedDiagnostics.push([id, diagnostic]);
+        }
         transitions = changes;
         try { return operation(state); } finally { transitions = undefined; }
       });
+      for (const [id, diagnostic] of appliedDiagnostics) if (pendingDiagnostics.get(id) === diagnostic) pendingDiagnostics.delete(id);
       // Wake only after the state has committed, never on failed writes.
       for (const change of changes) for (const waiter of [...(waiters.get(change.id) || [])]) waiter.finish(change.value);
       return result;
@@ -370,6 +380,7 @@ function invalidatePolicy(state, policy, time, approverId) {
         });
       } catch (error) {
         const storeError = error instanceof AuthStoreError;
+        if (storeError) pendingDiagnostics.set(id, { code: 'STORE_UNAVAILABLE', at: now() });
         await store.mutate((state) => {
           const row = state.requests.find((item) => item.id === id);
           if (!['approved','authenticating'].includes(row?.status)) return;
@@ -404,6 +415,7 @@ function invalidatePolicy(state, policy, time, approverId) {
         try { current = await execute(saved.requestId); }
         catch (error) {
           if (!(error instanceof AuthStoreError)) throw error;
+          pendingDiagnostics.set(saved.requestId, { code: 'STORE_UNAVAILABLE', at: now() });
           // A committed approval remains an approval even if storage is busy.
           try { current = outcome((await store.read()).requests.find(row => row.id === saved.requestId)); } catch {}
           current = { ...current, diagnostic: { code: 'STORE_UNAVAILABLE', credentialsSupplied: current.status === 'authenticating' } };
