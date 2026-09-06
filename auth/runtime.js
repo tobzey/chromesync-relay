@@ -261,6 +261,10 @@ export async function createAuthExecutor({ home, controller: suppliedController,
               blockedServices.has(entry.serviceId) || updatingServices.has(entry.serviceId)) throw new Error('Session handoff authorization changed');
           return { ...bundle, accountKey: entry.serviceId };
         }
+        case 'auth.wait': {
+          if (args.timeoutMs !== undefined && !Number.isFinite(args.timeoutMs)) throw new Error('Invalid wait timeout');
+          return broker.wait(args.requestId, principal.id, { timeoutMs: Math.max(1000, Math.min(100000, Math.trunc(args.timeoutMs ?? 60000))) });
+        }
         case 'auth.status': return broker.get(args.requestId, principal.id);
         case 'auth.cancel': return broker.cancel(args.requestId, principal.id);
         default: throw new Error('Operation unavailable to agent');

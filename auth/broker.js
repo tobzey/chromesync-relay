@@ -108,26 +108,6 @@ function audit(state, event, request, time, actorId, details = {}) {
   if (state.audit.length > 10_000) state.audit.splice(0, state.audit.length - 10_000);
 }
 
-function setState(state, request, status, reason, time, actorId) {
-  const previousStatus = request.status;
-  request.status = status;
-  if (status === 'succeeded') delete request.diagnostic;
-  request.updatedAt = time;
-  if (reason) request.reason = reason;
-  else delete request.reason;
-  if (!OPEN.has(status)) request.completedAt = time;
-  audit(state, status, request, time, actorId, { previousStatus, ...(reason ? { reason } : {}), ...(diagnosticView(request.diagnostic) ? { diagnostic: { code: request.diagnostic.code } } : {}) });
-}
-
-function expire(state, time) {
-  for (const request of state.requests) {
-    if (!['pending', 'approved', 'authenticating'].includes(request.status)) continue;
-    if (request.expiresAt > time && (!request.grant || request.grant.expiresAt > time)) continue;
-    setState(state, request, request.status === 'authenticating' ? 'needs-user' : 'expired',
-      request.status === 'authenticating' ? 'authentication-uncertain' : 'request-expired', time);
-  }
-}
-
 function pruneCompleted(state, time, reservedSlots = 1) {
   // Keep outcomes for 30 days, or the newest 5000 records under load. Never
   // evict an open ceremony or a result inside the maximum transport replay
@@ -140,23 +120,6 @@ function pruneCompleted(state, time, reservedSlots = 1) {
     .sort((a, b) => a.completedAt - b.completedAt);
   const removed = new Set(eligible.slice(0, state.requests.length - retainedLimit).map((row) => row.id));
   state.requests = state.requests.filter((row) => !removed.has(row.id));
-}
-
-function invalidatePolicy(state, policy, time, approverId) {
-  const active = [];
-  if (policy.revokedAt != null) return active;
-  policy.revokedAt = time;
-  policy.revokedBy = approverId ?? null;
-  state.audit.push({ id: randomUUID(), event: 'policy-revoked', policyId: policy.id, time, actorId: approverId ?? null });
-  for (const request of state.requests) {
-    if (request.grant?.policyId !== policy.id) continue;
-    if (request.status === 'approved') setState(state, request, 'denied', 'policy-revoked', time, approverId);
-    if (request.status === 'authenticating') {
-      active.push(request.id);
-      setState(state, request, 'needs-user', 'authentication-uncertain', time, approverId);
-    }
-  }
-  return active;
 }
 
 function sessionSnapshot(session, sessionId, requesterId, enrollment) {
@@ -222,6 +185,64 @@ export function createBroker({ store, controller, providers, now = Date.now, exe
   if (!Number.isSafeInteger(executionTimeoutMs) || executionTimeoutMs < 1 || executionTimeoutMs > GRANT_TTL) {
     throw new Error('Invalid authentication timeout');
   }
+  const waiters = new Map();
+  const requesterWaits = new Map();
+  let waitCount = 0, waitsClosing = false, transitions;
+  const backingStore = store;
+  store = {
+    read: (...args) => backingStore.read(...args),
+    async mutate(operation) {
+      const changes = [];
+      const result = await backingStore.mutate(state => {
+        transitions = changes;
+        try { return operation(state); } finally { transitions = undefined; }
+      });
+      // Wake only after the state has committed, never on failed writes.
+      for (const change of changes) for (const waiter of [...(waiters.get(change.id) || [])]) waiter.finish(change.value);
+      return result;
+    },
+  };
+function setState(state, request, status, reason, time, actorId) {
+  const previousStatus = request.status;
+  request.status = status;
+  if (status === 'succeeded') delete request.diagnostic;
+  request.updatedAt = time;
+  if (reason) request.reason = reason;
+  else delete request.reason;
+  if (!OPEN.has(status)) request.completedAt = time;
+  transitions?.push({ id: request.id, value: outcome(request) });
+  audit(state, status, request, time, actorId, { previousStatus, ...(reason ? { reason } : {}), ...(diagnosticView(request.diagnostic) ? { diagnostic: { code: request.diagnostic.code } } : {}) });
+}
+
+
+function expire(state, time) {
+  for (const request of state.requests) {
+    if (!['pending', 'approved', 'authenticating'].includes(request.status)) continue;
+    if (request.expiresAt > time && (!request.grant || request.grant.expiresAt > time)) continue;
+    setState(state, request, request.status === 'authenticating' ? 'needs-user' : 'expired',
+      request.status === 'authenticating' ? 'authentication-uncertain' : 'request-expired', time);
+  }
+}
+
+
+function invalidatePolicy(state, policy, time, approverId) {
+  const active = [];
+  if (policy.revokedAt != null) return active;
+  policy.revokedAt = time;
+  policy.revokedBy = approverId ?? null;
+  state.audit.push({ id: randomUUID(), event: 'policy-revoked', policyId: policy.id, time, actorId: approverId ?? null });
+  for (const request of state.requests) {
+    if (request.grant?.policyId !== policy.id) continue;
+    if (request.status === 'approved') setState(state, request, 'denied', 'policy-revoked', time, approverId);
+    if (request.status === 'authenticating') {
+      active.push(request.id);
+      setState(state, request, 'needs-user', 'authentication-uncertain', time, approverId);
+    }
+  }
+  return active;
+}
+
+
   let initialization;
   const running = new Map();
   const aborters = new Map();
@@ -383,6 +404,43 @@ export function createBroker({ store, controller, providers, now = Date.now, exe
   }
 
   const broker = {
+    async wait(id, requesterId, { timeoutMs = 60000, signal } = {}) {
+      if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 100000) throw new Error('Invalid wait timeout');
+      await initialize();
+      const current = await broker.get(id, requesterId);
+      const waiting = value => ['pending', 'approved', 'authenticating'].includes(value.status);
+      if (!waiting(current) || signal?.aborted || waitsClosing) return current;
+      if (waitCount >= 16 || (requesterWaits.get(requesterId) || 0) >= 2) return { ...current, reason: 'wait-capacity' };
+      let resolve, reject, timer, done = false;
+      const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+      const clean = () => {
+        if (done) return false;
+        done = true; clearTimeout(timer); signal?.removeEventListener('abort', aborted);
+        waiters.get(id)?.delete(entry); if (!waiters.get(id)?.size) waiters.delete(id);
+        waitCount--; const count = requesterWaits.get(requesterId) - 1;
+        if (count) requesterWaits.set(requesterId, count); else requesterWaits.delete(requesterId);
+        return true;
+      };
+      const entry = { finish(value) { if (clean()) resolve(value); }, async stop() {
+        try { entry.finish({ ...await broker.get(id, requesterId), timedOut: true }); } catch (error) { if (clean()) reject(error); }
+      } };
+      const aborted = () => { entry.stop(); };
+      if (!waiters.has(id)) waiters.set(id, new Set());
+      waiters.get(id).add(entry); waitCount++; requesterWaits.set(requesterId, (requesterWaits.get(requesterId) || 0) + 1);
+      signal?.addEventListener('abort', aborted, { once: true });
+      try {
+        // Register before rechecking to close the read/subscribe race.
+        const latest = await broker.get(id, requesterId);
+        if (latest.status !== current.status || !waiting(latest)) entry.finish(latest);
+        else if (signal?.aborted || waitsClosing) entry.finish({ ...latest, timedOut: true });
+        if (!done) {
+          const row = (await store.read()).requests.find(row => row.id === id && row.requesterId === requesterId);
+          if (!done) timer = setTimeout(() => { entry.stop(); }, Math.min(timeoutMs, Math.max(1, Math.min(row?.expiresAt ?? Infinity, row?.grant?.expiresAt ?? Infinity) - now())));
+        }
+      } catch (error) { if (clean()) reject(error); }
+      return promise;
+    },
+
     async request(value, requesterId, { waitForExecution = true } = {}) {
       await initialize();
       let input;
@@ -774,7 +832,11 @@ export function createBroker({ store, controller, providers, now = Date.now, exe
     },
 
     async drain({ abort = false } = {}) {
-      if (abort) abortRequests([...running.keys()]);
+      if (abort) {
+        waitsClosing = true;
+        await Promise.allSettled([...waiters.values()].flatMap(entries => [...entries].map(entry => entry.stop())));
+        abortRequests([...running.keys()]);
+      }
       while (running.size) await Promise.allSettled([...running.values()]);
     },
   };

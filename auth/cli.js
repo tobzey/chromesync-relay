@@ -37,6 +37,7 @@ const HELP = `ChromeSync authentication — protected browser access and approva
   chromesync auth request --session SESSION --revision REVISION [--factors password,totp]
     [--username-handle HANDLE] [--password-handle HANDLE]
     [--totp-handles HANDLE,HANDLE] [--submit-handle HANDLE]
+  chromesync auth wait --request REQUEST_ID [--timeout SECONDS]
   chromesync auth status --request REQUEST_ID
   chromesync auth cancel --request REQUEST_ID
   chromesync auth handoff --session SESSION [--name PROFILE] [--headless]
@@ -72,7 +73,7 @@ async function run(argv) {
     'username-handle': { type: 'string' }, 'password-handle': { type: 'string' },
     'totp-handles': { type: 'string' }, 'submit-handle': { type: 'string' },
     name: { type: 'string' }, headless: { type: 'boolean' },
-    watch: { type: 'boolean' }, interval: { type: 'string' }, decision: { type: 'string' },
+    timeout: { type: 'string' }, watch: { type: 'boolean' }, interval: { type: 'string' }, decision: { type: 'string' },
   } });
   const command = positionals[0] || 'help';
   if (values.help || command === 'help') { console.log(HELP); return; }
@@ -163,6 +164,11 @@ async function run(argv) {
   }
   const remote = createAuthRemote(home);
   if (remote.role !== 'agent') throw new Error('Browser commands require an agent identity');
+  if (command === 'wait') {
+    const { waitForAuth } = await import('./wait-cli.js');
+    const timeoutSeconds = values.timeout === undefined ? 300 : Number(values.timeout);
+    return output(await waitForAuth(remote, required('request'), { timeoutSeconds }));
+  }
   if (command === 'handoff') {
     const { importAuthenticatedSession } = await import('./session-handoff.js');
     // Cookie values must never become CLI output or a temporary export file.

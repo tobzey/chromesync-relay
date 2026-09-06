@@ -207,3 +207,5 @@ CHROMESYNC_TEST_CHROME='/absolute/path/to/Chrome for Testing' npm run test:auth:
 The strict entrypoint enables every browser test and fails if a compatible browser or the pinned SDK is missing. The dedicated authentication CI workflow runs this suite on macOS/Linux with a pinned, checksum-verified Chrome for Testing download. Release builds depend on both the existing regression workflow and authentication integration. Hosted CI has to run on the repository before its results can be claimed.
 
 The fixture replaces only OS credential storage for tests and is not shipped as a production backend. Browser tests use disposable synthetic accounts, temporary profiles and virtual authenticators. Verify a real, deliberately enrolled 1Password test vault before declaring a deployment compatible with its services. The acceptance record is [auth/IMPLEMENTATION.md](../auth/IMPLEMENTATION.md).
+
+Agents should use `chromesync auth wait --request REQUEST_ID` after requesting authentication. The executor wakes the wait when status changes; the CLI continues until a terminal outcome or its five-minute deadline. Use `auth status --request REQUEST_ID` for a one-shot check.

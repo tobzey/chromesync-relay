@@ -73,7 +73,7 @@ export function createRelayCaller({ identity, peer, io = DEFAULT_IO, now = Date.
   };
 }
 
-export function createRelayExecutor({ identity, getPeers, store, dispatch, isReadOnly = () => false, io = DEFAULT_IO, now = Date.now }) {
+export function createRelayExecutor({ identity, getPeers, store, dispatch, isReadOnly = () => false, isEphemeral = operation => operation === 'auth.wait', io = DEFAULT_IO, now = Date.now }) {
   let polling = false, rejectedEnvelopes = 0;
   const active = new Set();
   const jobs = new Set();
@@ -114,14 +114,14 @@ export function createRelayExecutor({ identity, getPeers, store, dispatch, isRea
   }
   async function executeCommand(peer, entry, { header, value }, commandKey) {
       let previous;
-      let ephemeralRead = false;
+      let ephemeralRead = isEphemeral(value.operation);
       let rejected = false;
       const readOnly = isReadOnly(value.operation);
       const owner = ['approver', 'executor'].includes(peer.identity.role);
       const cleanup = owner && (['policy.revoke', 'peer.revoke'].includes(value.operation) ||
         (value.operation === 'request.decide' && value.args?.decision === 'deny') ||
         (value.operation === 'takeover.finish' && value.args?.cancel === true));
-      await store.mutate(state => {
+      if (!ephemeralRead) await store.mutate(state => {
         compactAuthState(state, now());
         const journal = state.transport ||= {};
         previous = journal[commandKey];

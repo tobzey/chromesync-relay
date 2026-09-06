@@ -958,3 +958,39 @@ test('pending requests sort newest first ahead of recovery rows and expose total
   const third = await f.broker.listPendingPage({ limit: 2, cursor: second.nextCursor });
   assert.deepEqual(third.items.map(r => r.requestId), ['approved-newer', 'authenticating-newer']);
 });
+
+test('wait wakes on committed approval, cancellation and expiry and hides foreign rows', async t => {
+  const f = await fixture(t); const request = await f.request();
+  assert.deepEqual(await f.broker.wait(request.requestId, 'outsider'), { status: 'failed', reason: 'not-found' });
+  const pending = f.broker.wait(request.requestId, 'agent-1');
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await f.broker.decide(request.requestId, { decision: 'once' }, 'owner-1', { waitForExecution: false });
+  assert.equal((await pending).status, 'approved');
+  await f.broker.drain();
+  assert.equal((await f.broker.wait(request.requestId, 'agent-1')).status, 'succeeded');
+  f.addSession('wait-cancel'); const cancel = await f.request('wait-cancel');
+  const cancelled = f.broker.wait(cancel.requestId, 'agent-1');
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await f.broker.cancel(cancel.requestId, 'agent-1');
+  assert.equal((await cancelled).status, 'cancelled');
+  f.addSession('wait-expire'); const expiring = await f.request('wait-expire');
+  const expired = f.broker.wait(expiring.requestId, 'agent-1');
+  await new Promise(resolve => setTimeout(resolve, 20));
+  f.advance(300001); await f.broker.get(expiring.requestId, 'agent-1');
+  assert.equal((await expired).status, 'expired');
+});
+
+test('wait timeout, requester cap, global cap and draining release every subscription', async t => {
+  const f = await fixture(t); const request = await f.request();
+  assert.equal((await f.broker.wait(request.requestId, 'agent-1', { timeoutMs: 10 })).timedOut, true);
+  const waits = [f.broker.wait(request.requestId, 'agent-1'), f.broker.wait(request.requestId, 'agent-1')];
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal((await f.broker.wait(request.requestId, 'agent-1')).reason, 'wait-capacity');
+  await f.store.mutate(state => { const row = state.requests[0]; for (let i = 0; i < 15; i++) state.requests.push({ ...row, id: `wait-${i}`, requesterId: `waiter-${i}` }); });
+  for (let i = 0; i < 14; i++) waits.push(f.broker.wait(`wait-${i}`, `waiter-${i}`));
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal((await f.broker.wait('wait-14', 'waiter-14')).reason, 'wait-capacity');
+  await f.broker.drain({ abort: true });
+  const outcomes = await Promise.all(waits);
+  assert.equal(outcomes.length, 16); assert(outcomes.every(row => row.timedOut));
+});
