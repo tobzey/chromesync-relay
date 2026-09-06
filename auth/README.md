@@ -28,3 +28,5 @@ chromesync auth service uninstall
 ```
 
 Uninstallation stops/removes the service definition and preserves authentication state, enrollment, and the dedicated receiver profile. Nothing is installed merely by importing the service module or generating a definition. Tests use temporary home directories and a fake service-manager runner; they do not register real services.
+
+The inbox persists its first loopback port in authentication configuration so notification permission survives restart. `--port` overrides it. An occupied saved port falls back to a new ephemeral port, emits `portFallback: true`, and may require a new notification grant. The listener remains bound only to `127.0.0.1`. Enable notifications in the header, or use `chromesync auth approvals --watch` on a headless approver.

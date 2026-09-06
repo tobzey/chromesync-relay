@@ -73,13 +73,17 @@ Requests and activations expire after 15 minutes. The role is included in the fi
 
 ## Start the executor and inbox
 
-On the executor, run `chromesync auth executor`. On the daily driver, run `chromesync auth approvals`. Open the loopback inbox URL printed by that command. The inbox listener is bound to `127.0.0.1`, checks the exact Host/Origin, uses an HttpOnly SameSite cookie and CSRF token, and serves no third-party scripts.
+On the executor, run `chromesync auth executor`. On the daily driver, run `chromesync auth approvals`. The first inbox port is saved and reused, preserving the browser notification permission for that loopback origin. `--port` overrides and updates it. If a saved port is occupied, startup uses a new ephemeral port and reports `portFallback: true`; enable notifications again on that new origin. Open the loopback inbox URL printed by that command. The inbox listener is bound to `127.0.0.1`, checks the exact Host/Origin, uses an HttpOnly SameSite cookie and CSRF token, and serves no third-party scripts.
+
+Use **Enable notifications** in the inbox header to grant browser notification permission. Each newly observed pending request, including those present when the inbox first opens, generates one tagged notification. The title and application badge show the total open count; an optional chime plays after a user gesture has enabled audio. Keep the inbox open for browser notifications. Notification delivery remains subject to the browser and operating system's notification/focus settings.
+
+Headless approvers can run `chromesync auth approvals --watch --interval 15`; the minimum interval is five seconds. It prints one JSON pending event per newly seen request and sends a terminal bell to stderr. `chromesync auth requests` lists one page, and `chromesync auth decide --request REQUEST_ID --decision once|always|deny [--factors password,totp]` makes an owner decision. These commands require an approver identity.
 
 The executor also offers a local inbox for initial setup. Keep this UI on a trusted host; do not expose its port through a public reverse proxy. Remote approval uses the enrolled approval identity through the encrypted relay.
 
 Use `chromesync auth service install` on an initialized executor or approval device to run its role as a macOS/Linux user service. After the service has started, `chromesync auth inbox` shows its local URL. Startup is asynchronous; if the inbox record is not ready, retry briefly and inspect the foreground command if it remains unavailable. `chromesync auth service uninstall` stops and removes only that authentication service. See [background service behavior](../auth/README.md). The OS credential store must be available to the user service; a locked keyring cannot supply unattended credentials.
 
-Interactive authentication requires relay budgets above the existing cookie-snapshot defaults. A dedicated authentication deployment can start with `RATE_IP_CAPACITY=120`, `RATE_IP_REFILL=20`, `RATE_ROOM_CAPACITY=120`, and `RATE_ROOM_REFILL=10`, while retaining room admission, size limits, quotas and expiry. Tune for the number of devices and expected browser operations. The client backs off on rate limits; executor polling is bounded by peer count. This version uses polling, so it is not instant push delivery.
+Interactive authentication requires relay budgets above the existing cookie-snapshot defaults. A dedicated authentication deployment can start with `RATE_IP_CAPACITY=120`, `RATE_IP_REFILL=20`, `RATE_ROOM_CAPACITY=120`, and `RATE_ROOM_REFILL=10`, while retaining room admission, size limits, quotas and expiry. Tune for the number of devices and expected browser operations. The client backs off on rate limits; executor polling is bounded by peer count. The transport still polls the relay; server-held agent waits remove repeated agent status commands, but delivery latency still includes executor/caller relay checks. Shipped rate-limit defaults are unchanged. Read-only timeouts discard their queued request blobs; mutation timeouts preserve replay delivery. Persistent HTTP 507 returns `uncertain/relay-capacity`. Rejected-envelope counts report clock/key problems without message contents.
 
 ## Connect a vault once
 
@@ -87,7 +91,7 @@ Interactive authentication requires relay budgets above the existing cookie-snap
 2. Open **Vault & devices** in the trusted inbox and connect the service account. Enter the token only in that owner UI. The executor validates SDK authentication and builds the accessible vault metadata catalog before saving it in its OS credential store. A rejected candidate does not replace an existing connection. Never paste the token into an agent conversation or command argument.
 3. Enable account discovery for the connection. Agents can now search accounts by exact website origin and optional item name. There is no per-account JSON setup for a standard login. Use distinct item titles when you have several accounts at the same site; usernames are not exposed by search.
 
-The inbox remembers its selected tab in the URL fragment and reloads saved connections independently of requests, accounts and devices. An empty token field after refresh is expected. Each saved card reports whether the executor has a credential, without returning that credential. A failed status poll preserves the last confirmed cards; an initial failure says status is unknown rather than showing an empty vault. After an executor restart, a saved connection is shown as unchecked until discovery or **Check connection** verifies it.
+The inbox remembers its selected tab in the URL fragment and loads saved connections independently of requests, accounts and devices when Vault & devices is selected. Connection polling is limited to once per 30 seconds and pauses during protected interaction; request refreshes occur about every three seconds while the browser tab is visible and ten seconds while hidden. An empty token field after refresh is expected. Each saved card reports whether the executor has a credential, without returning that credential. A failed status poll preserves the last confirmed cards; an initial failure says status is unknown rather than showing an empty vault. After an executor restart, a saved connection is shown as unchecked until discovery or **Check connection** verifies it.
 
 Use **Check connection** to revalidate the stored token and rebuild the catalog immediately, including after a failed refresh. The owner sees fixed diagnostic codes for a missing SDK, invalid/rejected authentication, vault or item access, network failures and capacity. Agents still receive a generic `catalog-provider-unavailable` result. A successful reconnect clears the previous catalog failure backoff. Upgrade and restart both the executor and approver when adopting this provider-status API; old executor versions do not supply the new credential-presence projection.
 
@@ -97,7 +101,7 @@ Selecting a password account privately calls the SDK's `items.get` to infer the 
 
 Selection binds that fresh browser to one account and creates its internal enrollment; it grants no permission. Account handles are short-lived and bound to the requesting agent and exact origin. Selecting another account requires a fresh discovery browser. The provider retrieves approved fields again for the actual fill. A TOTP code is resolved at its form step, with a rollover margin; the seed never reaches the agent. Clock health and [1Password service account quotas](https://www.1password.dev/service-accounts/rate-limits) remain deployment dependencies.
 
-Disabling discovery on a connection stops new searches and selections. Revoke existing permissions or devices separately to stop already enrolled access.
+Disabling discovery stops new searches and selections, but existing accounts and saved permissions can still use the credential. **Remove connection** drops the stored token first, revokes the connection's saved permissions, cancels open requests with `provider-removed`, and removes selected accounts and browser services. Removal is refused during catalog work. `provider-cleanup-incomplete` means the credential is gone but some cleanup failed; retry removal and check executor cleanup. Reconnecting the same ID requires fresh selection and approval and never restores revoked grants.
 
 ## Agent workflow
 
@@ -107,7 +111,7 @@ chromesync auth search --session SESSION_ID --query 'Work account'
 chromesync auth select --session SESSION_ID --item ITEM_HANDLE
 chromesync auth observe --session SESSION_ID
 chromesync auth request --session SESSION_ID --revision REVISION --factors password,totp
-chromesync auth status --request REQUEST_ID
+chromesync auth wait --request REQUEST_ID
 # Only after status is succeeded:
 chromesync auth handoff --session SESSION_ID --name service-work --headless
 chromesync auth close --session SESSION_ID
@@ -125,15 +129,43 @@ chromesync auth request --session SESSION_ID --revision REVISION \
 
 Include only fields currently present; a username-only first page does not need a password handle. For a split code, `--totp-handles HANDLE1,HANDLE2,HANDLE3,HANDLE4,HANDLE5,HANDLE6` preserves digit order. Handles must still refer to the same live controls and form. The executor follows subsequent standard steps privately, up to eight steps within 120 seconds. Changed controls, ambiguous forms, password-change fields and credential submissions to another origin are rejected. Adaptive pages may load public HTTPS subresources; top-level navigation remains at the selected exact origin and subframe documents are blocked. A separate identity provider therefore needs its own login-origin session or an advanced owner-configured flow.
 
-Requests covered by a decision return `approved` promptly. Poll `status` through `approved`/`authenticating` until the final outcome before continuing. Normal protected interaction uses `navigate`, `observe`, `click` and `type`; agents cannot type credential fields or use evaluation, raw DOM, network bodies, profile paths or CDP. Every agent observation and control channel pauses during authentication. Failed or uncertain fills quarantine the session until recovery or closure.
+Requests covered by a decision return `approved` promptly. Use `auth wait --request REQUEST_ID` through `approved`/`authenticating` until the final outcome before continuing. `auth status` remains a one-shot check. Each server-held wait wakes after the next committed state change; the CLI continues until a terminal outcome or its default 300-second deadline (`--timeout SECONDS`). An unchanged deadline returns `timedOut: true` with exit code zero. Waits are limited to two per requester and sixteen globally; `wait-capacity` asks callers to back off. Each relay hop is bounded to 100 seconds, and executor shutdown releases waits. Normal protected interaction uses `navigate`, `observe`, `click` and `type`; agents cannot type credential fields or use evaluation, raw DOM, network bodies, profile paths or CDP. Every agent observation and control channel pauses during authentication. Failed or uncertain fills quarantine the session until recovery or closure.
 
 Successful credential submission alone does not prove the selected account is signed in. Adaptive verification requires the private username to match an exact visible account indicator outside the form, or an owner-configured verification rule. Generic welcome pages and redirects return `needs-user` with `VERIFICATION_REQUIRED`. For those sites, the owner uses **Complete in protected browser**, checks the account, and explicitly confirms the authenticated state. That confirmation applies only to the current session/document; it does not silently learn a persistent verification rule. A new login challenge invalidates it, including inside a single-page app.
+
+Both protected source and passkey receiver views capture continuously, normally about one frame per 1.5–3 seconds over the relay. Captures schedule after the preceding call settles, back off to five seconds on failure, and show a waiting status. Calls are bounded to 30 seconds; manual refresh remains available and owner actions take priority over the next scheduled capture. Request and provider refreshes pause during takeover. JPEG observations do not enter the durable command journal. Oversized responses return `response-capacity` promptly.
+
+Takeover leases slide ten minutes on each owner action/observation, with an absolute 30-minute maximum. The view shows a countdown in its final minute; reopening starts a fresh lease. At most two takeovers per approver and eight globally can be starting or active. Inactive protected sessions are reaped after 15 minutes, excluding active operations and authentication/takeover leases. A request can outlive its browser: `sessionOpen: false` hides its takeover action, and `session-closed` asks the agent to open a new session. Closing a browser does not undo a website submission.
 
 The same protected owner view handles SMS or unfamiliar forms. Only the acting approver receives its viewport and click/type/keyboard controls while the agent is paused. An unfinished challenge, cancellation or timeout leaves the session quarantined. Native OS dialogs require access to the actual trusted device. Advanced configured flows still require their declared account marker before resuming.
 
 For failed or unresolved requests, **Review and retry** re-inspects the browser and requires a fresh decision, including when a saved permission exists. An already authenticated browser can be verified without repeating the ceremony. Denial can interrupt an active ceremony but cannot undo a submission already accepted by the website.
 
 Outcomes include `pending`, `approved`, `authenticating`, `succeeded`, `needs-user`, `denied`, `cancelled`, `expired` and `failed`. A transport timeout returns `uncertain` with a command ID; it does not prove the action never ran. Inspect state before repeating a sensitive click. Durable command records prevent delivery retries from re-executing committed mutations.
+
+## Diagnostics
+
+Agent outcomes and owner request views optionally include `diagnostic: { code, credentialsSupplied }`. Stored diagnostics also include a timestamp; audit entries retain transition reason, previous status and code. Codes are bounded uppercase identifiers, never page/provider messages or stack traces. Success clears the current diagnostic; retry history retains prior evidence. A rejection through the relay/inbox includes a validated code such as `SESSION_NOT_FOUND`, `SESSION_CLOSED`, `REQUESTER_REVOKED`, `SESSION_BUSY`, `TAKEOVER_NOT_FOUND` or `ENROLLMENT_UNAVAILABLE`; older peers without a code use `OPERATION_REJECTED`. CLI rejection output is fixed JSON.
+
+| Reason or diagnostic | Agent/owner action |
+| --- | --- |
+| `authentication-uncertain`, `credentialsSupplied: true` | Credentials reached the page but login is unverified. Inspect the protected site before retrying; do not automatically rotate credentials or repeat submission. |
+| `VERIFICATION_REQUIRED`, `SUCCESS_NOT_CONFIRMED`, `ACCOUNT_MISMATCH` | Check the actual signed-in account in the protected browser and confirm only the selected account. |
+| `TOTP_UNAVAILABLE` | The site requested an authenticator code absent from the enrolled account. |
+| `PASSWORD_CHANGE_FORBIDDEN` | Complete password changes yourself; automated login cannot perform them. |
+| `EXPECTED_CONTROL_UNAVAILABLE` | The expected sign-in control is missing or changed. Inspect the current form. |
+| `SESSION_CHANGED` / `session-changed` | The document or request binding changed. Observe again and obtain fresh approval where needed. |
+| `AUTH_FLOW_UNAVAILABLE` / `unrecognized-authentication` | Use owner interaction for an unrecognized login flow. |
+| `BROWSER_CLOSED`, `SESSION_NOT_FOUND` / `browser-unavailable`, `session-closed` | Open a new protected session and request again. |
+| `AUTH_INVALID`, `AUTH_REJECTED`, `CREDENTIAL_MISSING` | Check the saved connection/token in Vault & devices. |
+| `NETWORK_UNAVAILABLE`, `AUTH_UNAVAILABLE`, `CREDENTIALS_UNAVAILABLE`, `VAULTS_UNAVAILABLE`, `ITEMS_UNAVAILABLE`, `RATE_LIMITED` | Check executor connectivity and scoped provider access; respect the provider's retry time. |
+| `SDK_UNAVAILABLE`, `SDK_INVALID`, `VAULT_ACCESS_MISSING`, `CATALOG_CAPACITY`, `CONNECTION_CHANGED` | Repair the executor SDK or check the current connection and vault scope. |
+| `PAGE_TIMEOUT`, `FLOW_TIMEOUT`, `AUTHENTICATION_RETRY_REQUIRED` | Inspect the current page before retrying a timed-out or changed challenge. |
+| `CREDENTIAL_LEASE_ENDED`, `ABORTED`, `STORE_UNAVAILABLE` | The credential operation was interrupted or persistence failed. Confirm state before retrying. |
+| `FILL_FAILED`, `AUTHENTICATION_FAILED`, `AUTHENTICATION_NOT_COMPLETED` | Safe generic fill diagnostics; inspect the protected browser. `authentication-failed` is retained for older providers returning no code. |
+| `interaction-required`, `provider-unsupported`, `provider-unavailable` | Owner interaction, a supported factor or a repaired provider connection is required. |
+| `wait-capacity`, `takeover-capacity`, `relay-capacity`, `response-capacity` | Back off, close unused views or reduce the response; do not infer that a timed-out mutation never ran. |
+| `provider-removed`, `provider-cleanup-incomplete`, `provider-removal-unconfirmed` | Reconnect only after checking removal/cleanup state; old grants must be retired before a replacement token is saved. |
 
 ## Session handoff
 
@@ -207,5 +239,3 @@ CHROMESYNC_TEST_CHROME='/absolute/path/to/Chrome for Testing' npm run test:auth:
 The strict entrypoint enables every browser test and fails if a compatible browser or the pinned SDK is missing. The dedicated authentication CI workflow runs this suite on macOS/Linux with a pinned, checksum-verified Chrome for Testing download. Release builds depend on both the existing regression workflow and authentication integration. Hosted CI has to run on the repository before its results can be claimed.
 
 The fixture replaces only OS credential storage for tests and is not shipped as a production backend. Browser tests use disposable synthetic accounts, temporary profiles and virtual authenticators. Verify a real, deliberately enrolled 1Password test vault before declaring a deployment compatible with its services. The acceptance record is [auth/IMPLEMENTATION.md](../auth/IMPLEMENTATION.md).
-
-Agents should use `chromesync auth wait --request REQUEST_ID` after requesting authentication. The executor wakes the wait when status changes; the CLI continues until a terminal outcome or its five-minute deadline. Use `auth status --request REQUEST_ID` for a one-shot check.

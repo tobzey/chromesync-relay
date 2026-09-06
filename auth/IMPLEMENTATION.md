@@ -1,5 +1,27 @@
 # Authentication implementation and completion evidence
 
+## Acceptance loop fixes on 2026-09-06
+
+WP0 established the pinned-browser baseline below. WP1 preserves safe fill/provider diagnostics through controller, broker, audit, relay, CLI and inbox; submitted-but-unverified credentials remain uncertain. WP2 reaps inactive browsers and retains failed-close handles and capacity reservations for retry, including failed startup cleanup; shutdown attempts every component. WP3 bounds orphaned read requests and capacity retries, reports rejected-envelope counts, prioritizes new pending approvals, exposes total open counts and lists room blobs oldest first. Rate-limit defaults remain unchanged.
+
+WP4 persists the loopback inbox origin, adds notification/title/badge/chime support and headless approver watch/list/decide commands. Background list failures cannot overwrite provider validation feedback. WP5 wakes capped subscriptions only after durable state changes, provides `auth wait`, and enforces the CLI's overall deadline without losing the last outcome. WP6 continuously captures source/receiver views, recovers with bounded backoff, slides takeover leases with an absolute maximum, handles closed sessions and keeps frame observations out of the durable journal. WP7 drops provider credentials before retiring authority; a failed retirement blocks token replacement until old grants are revoked. WP8 updates operator guidance and the live acceptance matrix.
+
+Final verification used Node 22.23.2 on macOS ARM64 and Chrome for Testing **152.0.7977.82**, downloaded outside the repository and verified against the workflow SHA-256 **6a12c6e76fcd0dc44accc8d28e93caa44ead57b71b8e0cac891bc3152a709790**. No local Google Chrome installation substituted for the pinned browser.
+
+| Command | Tests | Pass | Fail | Skip | Duration (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `npm run test:auth` | 207 | 197 | 0 | 10 | 23741.278667 |
+| `node scripts/test-auth-e2e.mjs` | 207 | 207 | 0 | 0 | 141177.837666 |
+| `npm run test:unit` | 124 | 124 | 0 | 0 | 22572.055709 |
+| `npm run test:security` | 38 | 38 | 0 | 0 | 15555.759667 |
+
+`npm run deploy:check` completed successfully with Wrangler 4.129.0 (`--dry-run`, no deployment). `npm pack --dry-run` completed successfully and includes the new auth operation, approver CLI and wait CLI modules among 128 package files. The fast suite's ten skips are the opt-in browser/runtime cases; the strict run above executes them with **zero skips**. Synthetic browser profiles and test state are cleaned up by their fixtures. The verified browser installation remains in the external testing cache for the following Tester run.
+
+Plan adjustments: the optional request-page cursor reset heuristic was omitted; priority ordering and total counts are implemented, and old cursor format remains accepted. Existing provider concurrency failures already use a safe structured `failed/busy` result, so those remain structured rather than becoming new throws. Selection without a valid discovery session retains its existing fixed guarded rejection. No cookie-sync features, companion transport, production rate defaults or live tenant data were changed.
+
+Live acceptance remains open for the executor Mac, daily-driver approver and agent box over the operator's Worker/R2 relay: notification permission/focus behavior, deployment admission and latency under shared load, real vault health, correct-account verification, passkey unlock/native dialogs and destination login after cookie handoff. Browser notifications need an open inbox. Cleanup-incomplete and closed-session outcomes require operator follow-up; synthetic success does not establish live site compatibility.
+
+
 ## Acceptance baseline on 2026-09-06 (WP0)
 
 At base `12e7750`, both locked dependency installs completed with lifecycle scripts disabled. Node 22.23.2 and Chrome for Testing 152.0.7977.82 (mac-arm64) were used; the archive SHA-256 matched the authentication workflow pin. The browser was installed outside the repository in the user's ChromeSync testing cache.
