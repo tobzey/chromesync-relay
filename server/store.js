@@ -153,10 +153,10 @@ export function createStore(config) {
         }
         if (!st.isFile()) continue;
         out.push({ name: n, size: st.size, mtime: Math.trunc(st.mtimeMs) });
-        if (out.length >= cap) break;
+
       }
-      out.sort((a, b) => a.name.localeCompare(b.name));
-      return out;
+      out.sort((a, b) => a.mtime - b.mtime || a.name.localeCompare(b.name));
+      return out.slice(0, cap);
     },
 
     delete(roomId, name) {

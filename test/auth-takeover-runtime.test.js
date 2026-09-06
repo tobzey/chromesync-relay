@@ -157,7 +157,7 @@ test('owner-only runtime takeover completes original unknown request and device 
       assert.deepEqual(await owner('takeover.finish',{takeoverId:takeover.takeoverId}),{status:'authenticated',completedRequests:1});
       assert.equal((await agent('auth.status',{requestId:request.requestId})).status,'succeeded');
       assert.equal((await agent('browser.observe',{sessionId:opened.id})).purpose,'authenticated');
-      assert.deepEqual(await owner('requests'),{items:[],nextCursor:null,hasMore:false});
+      assert.deepEqual(await owner('requests'),{items:[],nextCursor:null,hasMore:false,openCount:0});
       await assert.rejects(owner('takeover.observe',{takeoverId:takeover.takeoverId}));
       const state=await runtime.store.read();
       assert.equal(state.audit.find(item=>item.event==='takeover-completed').actorId,identities.owner.id);

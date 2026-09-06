@@ -43,19 +43,21 @@ function pageItems(values, options, kind, idOf) {
       const decoded = Buffer.from(cursor, 'base64url');
       if (decoded.toString('base64url') !== cursor) throw new Error();
       const key = JSON.parse(decoded.toString('utf8'));
-      if (!Array.isArray(key) || key.length !== 4 || key[0] !== 1 || key[1] !== kind ||
-          !Number.isSafeInteger(key[2]) || key[2] < 0 || !validId(key[3])) throw new Error();
-      after = key.slice(2);
+      if (!Array.isArray(key) || key[1] !== kind) throw new Error();
+      if (key[0] === 1 && key.length === 4) after = [0, key[2], key[3]];
+      else if (key[0] === 2 && key.length === 5) after = key.slice(2);
+      else throw new Error();
+      if (!Number.isInteger(after[0]) || after[0] < 0 || after[0] > 3 || !Number.isSafeInteger(after[1]) || after[1] < 0 || !validId(after[2])) throw new Error();
     } catch { throw new Error('Invalid authentication page'); }
   }
-  const keyOf = (row) => [Number.isSafeInteger(row.createdAt) && row.createdAt >= 0 ? row.createdAt : 0, idOf(row)];
-  const compare = (a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0);
+  const keyOf = (row) => [kind === 'requests' ? ({ pending: 0, approved: 3, authenticating: 3, 'needs-user': 1, failed: 2 }[row.status] ?? 3) : 0, Number.isSafeInteger(row.createdAt) && row.createdAt >= 0 ? row.createdAt : 0, idOf(row)];
+  const compare = (a, b) => a[0] - b[0] || (kind === 'requests' ? b[1] - a[1] : a[1] - b[1]) || (a[2] < b[2] ? -1 : a[2] > b[2] ? 1 : 0);
   const ordered = values.map((row) => ({ row, key: keyOf(row) })).sort((a, b) => compare(a.key, b.key))
     .filter(({ key }) => !after || compare(key, after) > 0);
   const items = [];
   let nextCursor = null;
   for (const { row, key } of ordered.slice(0, limit)) {
-    const candidateCursor = Buffer.from(JSON.stringify([1, kind, ...key])).toString('base64url');
+    const candidateCursor = Buffer.from(JSON.stringify([2, kind, ...key])).toString('base64url');
     const candidate = { items: [...items, row], nextCursor: candidateCursor, hasMore: true };
     if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') > MAX_PAGE_BYTES) {
       if (!items.length) throw new Error('Authentication record exceeds page capacity');
@@ -479,7 +481,7 @@ export function createBroker({ store, controller, providers, now = Date.now, exe
             ...(enrollment?.catalog ? { catalog: enrollment.catalog, sessionHandoff: true } : {}) };
         });
         // Include owner-facing metadata before enforcing the encrypted page size.
-        return pageItems(items, options, 'requests', (row) => row.requestId);
+        return { ...pageItems(items, options, 'requests', (row) => row.requestId), openCount: items.length };
       });
     },
 

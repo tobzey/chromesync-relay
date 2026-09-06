@@ -438,3 +438,12 @@ test("unadmitted room is denied", async () => {
     assert.deepEqual(JSON.parse(asText(listRes.body)), []);
   });
 });
+
+test('room listing selects oldest uploads before applying the cap', async () => {
+  const { list } = await import('../worker/store.js');
+  const bucket = new MemoryR2Bucket(), { roomId } = auth();
+  const names = ['chromesync-aa-1.csync', 'chromesync-bb-1.csync', 'chromesync-cc-1.csync'];
+  for (let i = 0; i < names.length; i++) { const key = blobKey(roomId, names[i]); await bucket.put(key, new Uint8Array([1])); bucket.objects.get(key).uploaded = new Date(3000 - i * 1000); }
+  const result = await list(bucket, { maxBlobsPerRoom: 2 }, roomId, 4000);
+  assert.deepEqual(result.items.map(r => r.name), [names[2], names[1]]);
+});

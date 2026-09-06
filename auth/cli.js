@@ -128,8 +128,15 @@ async function run(argv) {
           }
           writePrivate(path.join(home, 'inbox.json'), { pid: process.pid, url: inbox.url, role: command });
           output({ status: 'ready', role: command, approvalInbox: inbox.url });
+          let lastRejectionWarning = 0;
           while (!controller.signal.aborted) {
-            if (executor) await executor.poll();
+            if (executor) {
+              const result = await executor.poll();
+              if (result.rejectedEnvelopes > 0 && Date.now() - lastRejectionWarning >= 60000) {
+                console.error(`Rejected ${result.rejectedEnvelopes} relay messages (clock skew or foreign key). Check device clocks.`);
+                lastRejectionWarning = Date.now();
+              }
+            }
             const peerCount = executor ? loadAuthSecrets(home).peers.filter(peer => peer.enabled).length : 0;
             await delay(Math.max(1000, peerCount * 100), undefined, { signal: controller.signal }).catch(error => { if (error.name !== 'AbortError') throw error; });
           }

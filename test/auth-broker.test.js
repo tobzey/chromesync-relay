@@ -943,3 +943,18 @@ test('store failure selecting execution preserves approved instead of browser-un
   await assert.rejects(broker.decide(request.requestId, { decision: 'once' }, 'owner-1'), AuthStoreError);
   assert.equal((await f.store.read()).requests[0].status, 'approved');
 });
+
+test('pending requests sort newest first ahead of recovery rows and expose total attention count', async t => {
+  const f = await fixture(t); await f.request();
+  await f.store.mutate(state => {
+    const row = state.requests[0];
+    state.requests = [['old-pending', 'pending', 1], ['failed', 'failed', 9], ['new-pending', 'pending', 3], ['needs', 'needs-user', 10], ['approved-newer', 'approved', 99], ['authenticating-newer', 'authenticating', 98]].map(([id, status, createdAt]) => ({ ...row, id, status, createdAt }));
+  });
+  const first = await f.broker.listPendingPage({ limit: 2 });
+  assert.equal(first.openCount, 6);
+  assert.deepEqual(first.items.map(r => r.requestId), ['new-pending', 'old-pending']);
+  const second = await f.broker.listPendingPage({ limit: 2, cursor: first.nextCursor });
+  assert.deepEqual(second.items.map(r => r.requestId), ['needs', 'failed']);
+  const third = await f.broker.listPendingPage({ limit: 2, cursor: second.nextCursor });
+  assert.deepEqual(third.items.map(r => r.requestId), ['approved-newer', 'authenticating-newer']);
+});

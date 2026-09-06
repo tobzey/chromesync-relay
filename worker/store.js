@@ -129,7 +129,7 @@ export async function list(bucket, config, roomId, now = Date.now()) {
     const uploaded = obj.uploaded instanceof Date ? obj.uploaded.getTime() : Number(obj.uploaded) || 0;
     items.push({ name, size: obj.size, mtime: uploaded });
   }
-  items.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  items.sort((a, b) => a.mtime - b.mtime || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   const cap = config.maxBlobsPerRoom || 100;
   return { items: items.slice(0, cap), expiredKeys };
 }

@@ -81,15 +81,18 @@ test('provider cards survive reload and unrelated failures; connection actions n
       };
       const refreshProviders = async () => {
         const count = calls.filter(call => call.operation === 'providers').length;
-        await page(() => document.querySelector('[data-view="services"]').click());
+        await page(() => { const previous = Date.now; Date.now = () => previous() + 31000; document.querySelector('[data-view="services"]').click(); });
         await until(() => calls.filter(call => call.operation === 'providers').length > count, 'independent provider refresh starts');
       };
       const clickProvider = label => page(label => [...document.querySelectorAll('#provider-list button')].find(button => button.textContent === label).click(), label);
 
       await send('Page.navigate', { url: `${inbox.url}#requests` });
-      await until(async () => (await state()).cards.length === 1, 'providers load while the initial request list remains pending');
+      await until(() => calls.some(call => call.operation === 'requests'), 'request list starts');
       assert.equal((await state()).hash, '#requests');
-      await until(() => calls.filter(call => call.operation === 'providers').length >= 2, 'providers also refresh periodically while Requests is selected');
+      await delay(3200);
+      assert.equal(calls.filter(call => call.operation === 'providers').length, 0, 'Requests does not spend provider polling budget');
+      await refreshProviders();
+      await until(async () => (await state()).cards.length === 1, 'connections load when Vault and devices opens');
       requests.reject(new Error('Synthetic request-list failure'));
       await until(() => page(() => !document.querySelector('#notice').hidden), 'request-list failure is reported independently');
       assert.equal((await state()).cards[0].id, 'default', 'a failed request list does not clear the saved connection');

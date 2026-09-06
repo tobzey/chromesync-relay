@@ -2,6 +2,7 @@ const views = new Set(['requests', 'policies', 'services']);
 const viewFromHash = () => views.has(location.hash.slice(1)) ? location.hash.slice(1) : 'requests';
 let csrf, currentView = viewFromHash();
 const refreshing = new Set(), componentStatus = new Map(), providerActions = new Set();
+let lastProviderRefresh = 0;
 let savedProviders, providerRevision = 0, providerRenderKey;
 const preferences = new Map();
 const pages = Object.fromEntries(['requests', 'policies', 'services'].map(name => [name, { cursor: null, history: [] }]));
@@ -58,11 +59,13 @@ function failureText(request) {
   };
   return messages[request.diagnostic?.code] || 'Authentication did not complete. Review the service connection, then retry or complete it in the protected browser.';
 }
-function renderRequests(requests, hasMore) {
-  const key = JSON.stringify([requests, hasMore]);
+function renderRequests(requests, hasMore, openCount = requests.length) {
+  $('#count').textContent = String(openCount);
+  document.title = openCount ? `(${openCount}) ChromeSync approvals` : 'ChromeSync approvals';
+  const key = JSON.stringify([requests, hasMore, openCount]);
   if (requestRenderKey === key) return;
   requestRenderKey = key;
-  const list = $('#request-list'); list.replaceChildren(); $('#count').textContent = `${requests.length}${hasMore ? '+' : ''}`;
+  const list = $('#request-list'); list.replaceChildren();
   if (!requests.length) return empty(list, 'You’re all caught up.', 'New authentication requests will appear here.');
   for (const request of requests) {
     const card = element('article', undefined, 'card');
@@ -173,7 +176,8 @@ function applyProvider(value) {
   providerStatus('Showing confirmed connection status.', 'ready');
 }
 async function refreshProviders() {
-  if (!csrf || refreshing.has('providers') || providerActions.size) return;
+  if (!csrf || activeTakeover || currentView !== 'services' || refreshing.has('providers') || providerActions.size || Date.now() - lastProviderRefresh < 30000) return;
+  lastProviderRefresh = Date.now();
   refreshing.add('providers');
   const revision = providerRevision;
   providerStatus(savedProviders === undefined ? 'Loading saved connections…' : 'Refreshing connection status…', 'loading');
@@ -228,7 +232,7 @@ function refresh() {
   const work = [refreshProviders()];
   if (!activeTakeover) {
     if (currentView === 'requests') work.push(refreshComponent('requests', 'requests', { cursor: pages.requests.cursor }, page => {
-      renderRequests(page.items, page.hasMore); renderPages('requests', page, '#request-pages');
+      renderRequests(page.items, page.hasMore, Number.isSafeInteger(page.openCount) && page.openCount >= 0 ? page.openCount : page.items.length); renderPages('requests', page, '#request-pages');
     }));
     else if (currentView === 'policies') work.push(refreshComponent('policies', 'policies', { cursor: pages.policies.cursor }, page => {
       renderPolicies(page.items); renderPages('policies', page, '#policy-pages');
@@ -408,6 +412,7 @@ $('#example').addEventListener('click', () => {
 });
 (async () => {
   const response = await fetch('/api/bootstrap'); ({ csrf } = await response.json());
-  setInterval(() => { refresh(); if (activeTakeover?.mode === 'receiver') capture(); }, 3000);
+  const poll = async () => { await refresh(); if (activeTakeover?.mode === 'receiver') await capture(); setTimeout(poll, document.hidden ? 10000 : 3000); };
+  setTimeout(poll, document.hidden ? 10000 : 3000);
   await refresh();
 })().catch(() => { providerStatus('Connection status is unknown. Reload this trusted approval window to reconnect.', 'error'); notice('Reload this trusted approval window to reconnect.'); });

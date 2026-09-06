@@ -204,3 +204,30 @@ test('relay rejection codes round-trip without exception text', async () => {
   await assert.rejects(caller.call('browser.observe'), { code: 'SESSION_CLOSED', message: 'Authentication operation rejected (SESSION_CLOSED)' });
   assert(!JSON.stringify(f.state).includes('SECRET-SENTINEL'));
 });
+
+for (const operation of ['requests', 'browser.click']) test(`timeout cleanup respects ${operation} replay semantics`, async () => {
+  const f = transportFixture();
+  const caller = createRelayCaller({ identity: f.agent, peer: f.executorPeer, io: f.io, now: f.now, sleep: async ms => f.advance(ms) });
+  const result = await caller.call(operation, {}, { timeoutMs: 1000 });
+  assert.equal(result.status, 'uncertain');
+  assert.equal(f.blobs.has(messageName('request', result.commandId)), operation === 'browser.click');
+});
+
+test('relay capacity retries are bounded and return an uncertain capacity reason', async () => {
+  const f = transportFixture(); let calls = 0;
+  const caller = createRelayCaller({ identity: f.agent, peer: f.executorPeer, io: { ...f.io, push: async () => { calls++; throw Object.assign(new Error('Full'), { status: 507 }); } }, now: f.now, sleep: async ms => f.advance(ms) });
+  assert.equal((await caller.call('requests', {}, { timeoutMs: 2000 })).reason, 'relay-capacity');
+  assert(calls > 1 && calls < 10);
+});
+
+test('stale sweep preserves future timestamps and counts rejected envelopes without content', async () => {
+  const f = transportFixture();
+  const old = f.enqueue('requests'), future = f.enqueue('requests');
+  f.blobs.set(future.name, Buffer.from('SECRET-SENTINEL'));
+  const executor = createRelayExecutor({ identity: f.executorIdentity, getPeers: async () => [f.peer], store: f.store, now: f.now, dispatch: async () => ({}),
+    io: { ...f.io, list: async () => [{ name: old.name, mtime: f.now() - 240001 }, { name: future.name, mtime: f.now() + 1000000 }] } });
+  const result = await executor.poll();
+  assert.equal(result.rejectedEnvelopes, 1);
+  assert(!f.blobs.has(old.name)); assert(f.blobs.has(future.name));
+  assert(!JSON.stringify(result).includes('SECRET-SENTINEL'));
+});

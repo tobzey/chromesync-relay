@@ -339,3 +339,15 @@ test("unknown method ⇒ 405; unknown path ⇒ 404", async () => {
     assert.equal(missing.status, 404);
   });
 });
+
+test('filesystem room listing selects oldest files before applying the cap', async t => {
+  const { createStore } = await import('../server/store.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chromesync-list-order-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const { roomId } = auth();
+  fs.mkdirSync(path.join(root, roomId), { recursive: true });
+  const names = ['chromesync-aa-1.csync', 'chromesync-bb-1.csync', 'chromesync-cc-1.csync'];
+  names.forEach((name, i) => { const file = path.join(root, roomId, name); fs.writeFileSync(file, 'synthetic'); fs.utimesSync(file, 30 - i, 30 - i); });
+  const store = createStore({ dataDir: root, maxBlobsPerRoom: 2 });
+  assert.deepEqual(store.list(roomId).map(r => r.name), [names[2], names[1]]);
+});

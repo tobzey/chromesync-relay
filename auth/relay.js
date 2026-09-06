@@ -1,3 +1,4 @@
+import { readOnly } from './operations.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { relayPush, relayList, relayGet, relayDelete } from '../companion/relay-client.js';
 import { sealMessage, openMessage, newId, messageName, MESSAGE_TTL } from './protocol.js';
@@ -11,20 +12,25 @@ const MAX_JOURNAL = 2000;
 export function createRelayCaller({ identity, peer, io = DEFAULT_IO, now = Date.now, sleep = delay }) {
   if (!peer?.enabled) throw new Error('Authentication peer is disabled');
   return {
-    async call(operation, args = {}, { timeoutMs = 90000, signal } = {}) {
+    async call(operation, args = {}, { timeoutMs = 90000, signal, discardOnTimeout = readOnly.has(operation) } = {}) {
       if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > MESSAGE_TTL - 5000) throw new Error('Invalid call timeout');
       const id = newId();
       const started = now();
       const request = sealMessage({ type: 'command', operation, args }, identity, peer.identity, { id, now: started });
       const name = messageName('request', id), responseName = messageName('response', id);
-      const uncertain = () => ({ status: 'uncertain', reason: 'executor-unavailable-or-response-delayed', commandId: id });
+      let capacity = false;
+      const uncertain = async () => {
+        if (discardOnTimeout) await io.delete({ ...peer.channel, name }).catch(() => {});
+        return { status: 'uncertain', reason: capacity ? 'relay-capacity' : 'executor-unavailable-or-response-delayed', commandId: id };
+      };
       let pause = 500;
       let networkRetries = 0;
       for (;;) {
         try { await io.push({ ...peer.channel, name, blob: request }); break; }
         catch (error) {
+          capacity = error.status === 507;
           if (signal?.aborted || now() - started >= timeoutMs) return uncertain();
-          if (error.status && ![429, 503].includes(error.status)) throw error;
+          if (error.status && ![429, 503, 507].includes(error.status)) throw error;
           // No response does not prove rejection. Retry the same encrypted
           // command ID once, then look for its possibly committed response.
           if (!error.status && networkRetries++ >= 1) break;
@@ -46,7 +52,8 @@ export function createRelayCaller({ identity, peer, io = DEFAULT_IO, now = Date.
             }
             return value.result;
           } catch (error) {
-            if (error.status && ![404, 429, 503].includes(error.status)) throw error;
+            if (error.status === 507) capacity = true;
+            if (error.status && ![404, 429, 503, 507].includes(error.status)) throw error;
             if (!error.status && error.operationRejected === true) throw error;
             if (error.status !== 404) pause = Math.min(5000, pause * 2);
           }
@@ -67,7 +74,7 @@ export function createRelayCaller({ identity, peer, io = DEFAULT_IO, now = Date.
 }
 
 export function createRelayExecutor({ identity, getPeers, store, dispatch, isReadOnly = () => false, io = DEFAULT_IO, now = Date.now }) {
-  let polling = false;
+  let polling = false, rejectedEnvelopes = 0;
   const active = new Set();
   const jobs = new Set();
   const ephemeralResponses = new Map();
@@ -88,13 +95,14 @@ export function createRelayExecutor({ identity, getPeers, store, dispatch, isRea
         if (ownResponses.get(entry.name).expiresAt <= now()) await io.delete({ ...peer.channel, name: entry.name }).catch(() => {});
         continue;
       }
-      if (Number.isFinite(entry.mtime) && entry.mtime < now() - 15 * 60000) {
+      if (Number.isFinite(entry.mtime) && entry.mtime <= now() && entry.mtime < now() - 2 * MESSAGE_TTL) {
         await io.delete({ ...peer.channel, name: entry.name }).catch(() => {});
         continue;
       }
-      let opened;
-      try { opened = openMessage(await io.get({ ...peer.channel, name: entry.name }), identity, peer.identity, { now: now() }); }
-      catch { continue; }
+      let opened, blob;
+      try { blob = await io.get({ ...peer.channel, name: entry.name }); } catch { continue; }
+      try { opened = openMessage(blob, identity, peer.identity, { now: now() }); }
+      catch { rejectedEnvelopes++; continue; }
       const { header, value } = opened;
       if (value?.type !== 'command' || entry.name !== messageName('request', header.id)) continue;
       const commandKey = `${peer.identity.id}:${header.id}`;
@@ -163,11 +171,11 @@ export function createRelayExecutor({ identity, getPeers, store, dispatch, isRea
     async drain() { await Promise.allSettled([...jobs]); },
     async poll() {
       if (polling) return { status: 'busy' };
-      polling = true;
+      polling = true; rejectedEnvelopes = 0;
       try {
         const peers = (await getPeers()).filter(peer => peer.enabled);
         const results = await Promise.allSettled(peers.map(processPeer));
-        return { status: results.some(result => result.status === 'rejected') ? 'delivery-unavailable' : 'ready' };
+        return { status: results.some(result => result.status === 'rejected') ? 'delivery-unavailable' : 'ready', rejectedEnvelopes };
       } finally { polling = false; }
     },
   };

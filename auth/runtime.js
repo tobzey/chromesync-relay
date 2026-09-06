@@ -1,3 +1,4 @@
+import { readOnly } from './operations.js';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { createEncryptedStore } from './store.js';
@@ -417,7 +418,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
       default: throw new Error('Unknown authentication operation');
     }
   }
-  const readOnly = new Set(['services', 'requests', 'request.status', 'policies', 'enrollments', 'peers', 'providers', 'provider.check', 'accounts.search', 'browser.export', 'browser.observe', 'auth.status', 'takeover.observe', 'passkey.observe']);
+
   const relay = createRelayExecutor({ identity: secrets.identity, getPeers: async () => (await getSecrets()).peers, store, dispatch, isReadOnly: operation => readOnly.has(operation), io });
   return { broker, store, controller, dispatch, poll: () => closing ? { status: 'stopping' } : relay.poll(), close: () => closePromise ||= (async () => {
     closing = true; takeovers.clear(); discoverySessions.clear();
