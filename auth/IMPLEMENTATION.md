@@ -8,17 +8,19 @@ WP4 persists the loopback inbox origin, adds notification/title/badge/chime supp
 
 Review fixes (B1–B6 and M1–M10) restrict CLI JSON failures and diagnostics to fixed product codes; preserve committed decisions through one bounded store retry and independent startup recovery; retain authentication uncertainty during provider retirement; and reserve transport time for held waits. Pending summaries notify across pages while badges count only approver action. Closed/expired takeover views stop retrying, captures yield promptly to actions, and visibility changes refresh the inbox. Failed browser closes are reaped again, active relay blobs are deduplicated before fetch, stale cleanup uses fifteen minutes with clock-skew protection, and capacity errors remain sticky. Provider health respects credential-lease generations, replacement failures report retired grants, watch pagination stops at recovery rows, and temporary ports leave the saved port intact. Each review item has regression coverage, including direct `runAuthCli` tests and expanded disposable-browser scenarios.
 
+Second Tester follow-up: unused approved grants remain owner-retryable after expiry without requiring a previously saved diagnostic, including after restart. Store-outage diagnostics are buffered in memory and removed only after a successful mutation commits them; retries still inspect the browser and require a fresh decision. Wait hops now use the full remaining time (up to 60 seconds), with ten seconds of transport slack on top, and stop rather than issuing a final subsecond hop. Regression tests reproduce a sustained store outage and failed diagnostic commit, and assert the complete 30-, 65-, and 300-second hop sequences plus the 800-ms remainder case.
+
 Final verification used Node 22.23.2 on macOS ARM64 and Chrome for Testing **152.0.7977.82**, downloaded outside the repository and verified against the workflow SHA-256 **6a12c6e76fcd0dc44accc8d28e93caa44ead57b71b8e0cac891bc3152a709790**. No local Google Chrome installation substituted for the pinned browser.
 
 | Command | Tests | Pass | Fail | Skip | Duration (ms) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `npm run test:auth` | 236 | 226 | 0 | 10 | 25231.961041 |
-| `node scripts/test-auth-e2e.mjs` | 236 | 236 | 0 | 0 | 151260.820417 |
-| `npm run test:unit` | 124 | 124 | 0 | 0 | 24796.971833 |
-| `npm run test:security` | 38 | 38 | 0 | 0 | 19175.524167 |
-| `npm run test:relay` | 62 | 62 | 0 | 0 | 5081.435625 |
+| `npm run test:auth` | 242 | 232 | 0 | 10 | 26987.538958 |
+| `node scripts/test-auth-e2e.mjs` | 242 | 242 | 0 | 0 | 137370.826875 |
+| `npm run test:unit` | 124 | 124 | 0 | 0 | 27282.232291 |
+| `npm run test:security` | 38 | 38 | 0 | 0 | 19475.272084 |
+| `npm run test:relay` | 62 | 62 | 0 | 0 | 5532.93525 |
 
-`npm run deploy:check` completed successfully with Wrangler 4.129.0 (`--dry-run`, no deployment). `npm pack --dry-run` completed successfully and includes the new auth operation, approver CLI and wait CLI modules among 129 package files. The fast suite's ten skips are the opt-in browser/runtime cases; the strict run above executes them with **zero skips**. Synthetic browser profiles and test state are cleaned up by their fixtures. The verified browser installation remains in the external testing cache for the following Tester run.
+The preceding pass at `dbbdf67` ran `npm run deploy:check` successfully with Wrangler 4.129.0 (`--dry-run`, no deployment). That pass also ran `npm pack --dry-run` successfully and includes the new auth operation, approver CLI and wait CLI modules among 129 package files. The fast suite's ten skips are the opt-in browser/runtime cases; the strict run above executes them with **zero skips**. Synthetic browser profiles and test state are cleaned up by their fixtures. The verified browser installation remains in the external testing cache for the following Tester run.
 
 Plan adjustments: the optional request-page cursor reset heuristic was omitted; priority ordering and total counts are implemented, and old cursor format remains accepted. Existing provider concurrency failures already use a safe structured `failed/busy` result, so those remain structured rather than becoming new throws. Selection without a valid discovery session retains its existing fixed guarded rejection. No cookie-sync features, companion transport, production rate defaults or live tenant data were changed.
 
