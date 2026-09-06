@@ -52,8 +52,15 @@ export function adaptivePage(stateKey, planKey, operation, args = {}) {
         verified=matches.length===1;
       }
       const plan=globalThis[planKey];
+      // Cosmetic loading changes can invalidate a prepared plan without
+      // replacing the submitted controls. Never treat those same live fields
+      // (or the original passkey button) as a fresh credential challenge.
+      const previousControls=plan?Object.values(plan.fields).flat():[];
+      const submittedControlsPresent=!!plan&&plan.document===document&&plan.origin===location.origin&&
+        (previousControls.length?previousControls.some(el=>visible(el)&&el.form===plan.form&&!el.disabled&&!el.readOnly):
+          visible(plan.submit)&&plan.submit.form===plan.form);
       return {challenge,verified,structure:signature(items),prepared:!!plan&&!validate(plan),method:plan?.method,
-        fields:plan?Object.keys(plan.fields):[],newPassword:items.some(el=>role(el)==='new-password')};
+        fields:plan?Object.keys(plan.fields):[],submittedControlsPresent,newPassword:items.some(el=>role(el)==='new-password')};
     }
     if (operation==='clear') {
       const nodes=new Set([...items.filter(el=>['username','password','totp','new-password'].includes(role(el))),...Object.values(globalThis[planKey]?.fields||{}).flat()]);
@@ -109,6 +116,13 @@ export function adaptivePage(stateKey, planKey, operation, args = {}) {
       if (!submit || !submit.matches('button,input[type="submit"],input[type="button"],[role="button"]')) return {error:'CONTROL_UNAVAILABLE'};
       const plan={document,origin:location.origin,fields,form,submit,method,structures:new Map([...nodes,submit].map(el=>[el,JSON.stringify(structure(el))]))};
       const error=validate(plan);if(error)return {error};
+      if(args.requireReplacement===true){
+        const previous=globalThis[planKey];
+        const submitted=previous?Object.values(previous.fields).flat():[];
+        // A field can become editable again after the separate inspection.
+        // Compare node identity atomically before replacing the submitted plan.
+        if(submitted.some(el=>nodes.includes(el))||(!submitted.length&&previous?.submit===submit))return {error:'SUBMITTED_CONTROLS_PRESENT'};
+      }
       globalThis[planKey]=plan;
       return {method,fields:Object.keys(fields),structure:signature([...nodes,submit])};
     }

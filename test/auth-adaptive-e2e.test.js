@@ -17,7 +17,7 @@ test('adaptive browser binds live fields, completes password/TOTP, verifies acco
   skip:enabled?false:'Set CHROMESYNC_AUTH_BROWSER_E2E=1 for disposable browser tests',timeout:120000,
 },async t=>{
   const directory=await mkdtemp(path.join(tmpdir(),'chromesync-adaptive-'));
-  const states=new Map();let passwordPosts=0,otpPosts=0,unusedConnection;
+  const states=new Map();let passwordPosts=0,otpPosts=0,unusedConnection,delayedAccount,delayedPassword,loadingSubmission;
   const server=createServer(async(req,res)=>{
     const old=/session=([a-f0-9-]+)/.exec(req.headers.cookie||'')?.[1];
     const sid=old&&states.has(old)?old:randomUUID();
@@ -34,7 +34,13 @@ test('adaptive browser binds live fields, completes password/TOTP, verifies acco
       let body='';for await(const chunk of req)body+=chunk;
       state.username=new URLSearchParams(body).get('username');
       res.writeHead(303,{Location:'/password'});res.end();
-    }else if(url.pathname==='/password')res.end(form('/check-password','<label>Password<input name="password" type="password" autocomplete="current-password"></label>'));
+    }else if(url.pathname==='/password'){
+      const input='<label>Password<input name="password" type="password" autocomplete="current-password"></label>';
+      if(state.mode==='delayed'){
+        res.write(`<!doctype html><title>Password</title><form method="post" action="/check-password">${input}`);
+        delayedPassword={released:false,release(){if(!this.released){this.released=true;res.end('<button>Continue</button></form>');}}};
+      }else res.end(form('/check-password',input));
+    }
     else if(url.pathname==='/check-password'){
       let body='';for await(const chunk of req)body+=chunk;passwordPosts++;
       state.password=state.username===username&&new URLSearchParams(body).get('password')===password;
@@ -47,7 +53,17 @@ test('adaptive browser binds live fields, completes password/TOTP, verifies acco
     }else if(url.pathname==='/account'){
       if(state.mode==='echo')res.setHeader('Set-Cookie',`credential_echo=${password}; HttpOnly; Path=/`);
       const account=state.mode==='wrong'?'different-account@example.test':username;
-      res.end(`<!doctype html><title>Account</title>${state.mode==='unverified'?'<h1>Welcome</h1>':`<nav><span id="account-email">${account}</span></nav>`}<p>Signed in</p><a href="/login">Sign in again</a><button id="challenge">Require authentication</button><main></main><script>document.querySelector('#challenge').onclick=()=>{const form=document.createElement('form');form.innerHTML='<input type=password autocomplete=current-password><button type=button style="position:fixed;left:10px;top:200px">Dismiss challenge</button>';form.querySelector('button').onclick=()=>form.remove();document.querySelector('main').append(form);};</script>`);
+      const body=`${state.mode==='unverified'?'<h1>Welcome</h1>':`<nav><span id="account-email">${account}</span></nav>`}<p>Signed in</p><a href="/login">Sign in again</a><button id="challenge">Require authentication</button><main></main><script>document.querySelector('#challenge').onclick=()=>{const form=document.createElement('form');form.innerHTML='<input type=password autocomplete=current-password><button type=button style="position:fixed;left:10px;top:200px">Dismiss challenge</button>';form.querySelector('button').onclick=()=>form.remove();document.querySelector('main').append(form);};</script>`;
+      if(state.mode==='delayed'){
+        res.write('<!doctype html><title>Account</title><body><p>Loading account</p>');
+        delayedAccount={released:false,release(){if(!this.released){this.released=true;res.end(body+'</body>');}}};
+      }else res.end(`<!doctype html><title>Account</title>${body}`);
+    }else if(url.pathname==='/loading'){
+      res.end(form('/loading-submit','<input name="otp" autocomplete="one-time-code">','Verify')+`<script>document.querySelector('form').onsubmit=async event=>{event.preventDefault();const form=event.target,body=new URLSearchParams(new FormData(form));form.querySelector('button').textContent='Checking code';${url.searchParams.get('mode')==='disabled'?'form.querySelector("input").disabled=true;':''}await fetch(form.action,{method:'POST',body});location.assign('/account');};</script>`);
+    }else if(url.pathname==='/loading-submit'){
+      let body='';for await(const chunk of req)body+=chunk;otpPosts++;
+      state.authenticated=new URLSearchParams(body).get('otp')===totp;
+      loadingSubmission={released:false,release(){if(!this.released){this.released=true;res.end('Verification complete');}}};
     }else if(url.pathname==='/change')res.end(form('/never','<input type="password" autocomplete="new-password" name="new-password">'));
     else if(url.pathname==='/passkey')res.end(`<!doctype html><title>Passkey fixture</title><nav><span id="account-email">${username}</span></nav><button onclick="document.body.innerHTML='<nav><span id=account-email>${username}</span></nav>'">Sign in with a passkey</button>`);
     else if(url.pathname==='/unsafe')res.end(form('https://unapproved.example/steal','<input name="username" autocomplete="username"><input type="password" name="password">'));
@@ -58,7 +74,7 @@ test('adaptive browser binds live fields, completes password/TOTP, verifies acco
   const origin=`http://localhost:${server.address().port}`;
   const controller=createBrowserController({chromePath:process.env.CHROMESYNC_TEST_CHROME,profileRoot:directory,testing:{allowLoopbackHttp:true}});
   t.after(async()=>{
-    try {await controller.close();}
+    try {delayedAccount?.release();delayedPassword?.release();loadingSubmission?.release();await controller.close();}
     finally {
       try {
         await new Promise(resolve=>{
@@ -141,6 +157,81 @@ test('adaptive browser binds live fields, completes password/TOTP, verifies acco
   try {await assert.rejects(controller.exportSession(session.id,'agent'),{code:'SESSION_CHANGED'});}
   finally {raced.mock.restore();}
   await controller.closeSession(session.id,'agent');
+
+  // Commit an account document with no fields or identity, and send the rest
+  // only after the controller has inspected that intermediate document. This
+  // forces the navigation/verification race without relying on a fixed sleep.
+  const delayed=await discover('/login?mode=delayed');
+  const postsBefore={password:passwordPosts,otp:otpPosts};
+  let emptyAccountObserved=false,subsequentInspection=false,incompleteFormObserved=false;
+  const streaming=t.mock.method(PipeConnection.prototype,'send',async function(method,...args){
+    const inspecting=method==='Runtime.callFunctionOn'&&args[0]?.arguments?.[2]?.value==='inspect';
+    if(inspecting&&delayedAccount&&!delayedAccount.released&&emptyAccountObserved){
+      subsequentInspection=true;delayedAccount.release();
+    }
+    const result=await originalSend.call(this,method,...args);
+    if(method==='Runtime.callFunctionOn'&&args[0]?.arguments?.[2]?.value==='prepare'&&
+        delayedPassword&&!delayedPassword.released&&['CONTROL_UNAVAILABLE','AMBIGUOUS_AUTHENTICATION'].includes(result.result?.value?.error)){
+      incompleteFormObserved=true;delayedPassword.release();
+    }
+    if(inspecting&&delayedAccount&&!delayedAccount.released&&result.result?.value?.challenge===false)emptyAccountObserved=true;
+    return result;
+  });
+  try{
+    assert.deepEqual(await authenticate(delayed),{status:'authenticated'});
+    assert(emptyAccountObserved,'the newly committed account document was observed before its identity arrived');
+    assert(subsequentInspection,'the controller continued inspecting after that incomplete document');
+    assert(incompleteFormObserved,'the next credential form was observed before its submit button arrived');
+    assert.equal(passwordPosts,postsBefore.password+1);assert.equal(otpPosts,postsBefore.otp+1);
+    assert.equal((await controller.exportSession(delayed.id,'agent')).url,origin+'/account');
+  }finally{streaming.mock.restore();delayedAccount?.release();delayedPassword?.release();await controller.closeSession(delayed.id,'agent');}
+
+  // The original OTP controls stay live while only the submit label changes.
+  // Release the fetch response after that cosmetic state has been inspected.
+  const loading=await discover('/loading'),otpBeforeLoading=otpPosts;
+  let originalControlsObserved=false;
+  const loadingRace=t.mock.method(PipeConnection.prototype,'send',async function(method,...args){
+    const result=await originalSend.call(this,method,...args);
+    const state=result.result?.value;
+    if(method==='Runtime.callFunctionOn'&&args[0]?.arguments?.[2]?.value==='inspect'&&loadingSubmission&&!loadingSubmission.released&&
+        state?.submittedControlsPresent===true&&state.structure.includes('Checking code')){
+      originalControlsObserved=true;loadingSubmission.release();
+    }
+    return result;
+  });
+  try{
+    assert.deepEqual(await authenticate(loading),{status:'authenticated'});
+    assert(originalControlsObserved,'the loading label did not replace the submitted OTP controls');
+    assert.equal(otpPosts,otpBeforeLoading+1,'cosmetic loading changes never resubmit the OTP');
+  }finally{loadingRace.mock.restore();loadingSubmission?.release();await controller.closeSession(loading.id,'agent');}
+
+  // Re-enable the exact submitted OTP node between the transition inspection
+  // and preparation calls. The preparation must reject reusing that node even
+  // though its earlier inspection legitimately saw no editable old controls.
+  const reenabled=await discover('/loading?mode=disabled'),otpBeforeReenabled=otpPosts;
+  let disabledObserved=false,replacementBlocked=false;
+  const reenableRace=t.mock.method(PipeConnection.prototype,'send',async function(method,...args){
+    const result=await originalSend.call(this,method,...args);
+    const operation=method==='Runtime.callFunctionOn'?args[0]?.arguments?.[2]?.value:null;
+    const options=args[0]?.arguments?.[3]?.value||{},state=result.result?.value;
+    if(operation==='inspect'&&!Object.hasOwn(options,'expectedUsername')&&loadingSubmission&&!loadingSubmission.released&&
+        !disabledObserved&&state?.submittedControlsPresent===false&&state.structure.includes('Checking code')){
+      disabledObserved=true;
+      await originalSend.call(this,'Runtime.callFunctionOn',{executionContextId:args[0].executionContextId,
+        functionDeclaration:'function(){document.querySelector("input[name=otp]").disabled=false;}',returnByValue:true},args[1]);
+    }
+    if(operation==='prepare'&&disabledObserved&&loadingSubmission&&!loadingSubmission.released){
+      replacementBlocked=state?.error==='SUBMITTED_CONTROLS_PRESENT';
+      loadingSubmission.release();
+    }
+    return result;
+  });
+  try{
+    assert.deepEqual(await authenticate(reenabled),{status:'authenticated'});
+    assert(disabledObserved,'the controller inspected the temporarily disabled submitted input');
+    assert(replacementBlocked,'preparation atomically rejected the re-enabled original input');
+    assert.equal(otpPosts,otpBeforeReenabled+1,'the disabled/re-enabled gap never resubmits the OTP');
+  }finally{reenableRace.mock.restore();loadingSubmission?.release();await controller.closeSession(reenabled.id,'agent');}
 
   for(const mode of ['wrong','unverified']){
     const unknown=await discover('/login?mode='+mode);

@@ -318,24 +318,38 @@ export function createBrowserController({chromePath, profileRoot, services = [],
           values=undefined;
           await mouseClick(session,await callPage(session,adaptivePage,[session.stateKey,session.planKey,'submit',{}],lease.signal),lease.signal);
         }
-        // Wait for an actual new challenge/document. Never resubmit the same
-        // form merely because its asynchronous response has not arrived yet.
+        // Navigation can commit before the account body or next form is ready.
+        // Wait for verified identity or safely prepared replacement controls;
+        // a loading document or cosmetic changes never justify resubmission.
         const transitionDeadline=Math.min(deadline,Date.now()+10000);
-        let next;
+        let next,preparedNext=false,prepareError;
         while(Date.now()<transitionDeadline){
           abortIfNeeded(lease.signal);
+          if(session.lease!==lease||!lease.active)fail('ABORTED');
           if(session.blockedNavigation)fail('ORIGIN_NOT_ALLOWED');
           try{
             const snapshot=await inspect(session,lease.signal);
             if(snapshot.purpose==='authenticated')return {status:'authenticated'};
-            next=await callPage(session,adaptivePage,[session.stateKey,session.planKey,'inspect',{}],lease.signal);
-            if(session.loaderId+'|'+next.structure!==before)break;
+            next=await callPage(session,adaptivePage,[session.stateKey,session.planKey,'inspect',{method:session.service.adaptive.method}],lease.signal);
+            if(next.newPassword)return {status:'needs-user',reason:'PASSWORD_CHANGE_FORBIDDEN'};
+            if(session.loaderId+'|'+next.structure!==before&&next.challenge&&!next.submittedControlsPresent){
+              try{
+                // Preparing only validates and records controls. All secret
+                // retrieval, filling and submission remain outside this wait.
+                await callPage(session,adaptivePage,[session.stateKey,session.planKey,'prepare',{method:'password',requireReplacement:true}],lease.signal);
+                preparedNext=true;break;
+              }catch(error){
+                if(!['CONTROL_UNAVAILABLE','FIELD_UNAVAILABLE','AMBIGUOUS_AUTHENTICATION','INVALID_BINDINGS','STALE_HANDLE','SESSION_CHANGED','ADAPTIVE_PAGE_UNAVAILABLE','PAGE_OPERATION_FAILED','SUBMITTED_CONTROLS_PRESENT'].includes(error.code))throw error;
+                prepareError=error.code;
+              }
+            }
           }catch(error){if(['ABORTED','BROWSER_CLOSED','ORIGIN_NOT_ALLOWED'].includes(error.code))throw error;}
           await delay(100,undefined,{signal:lease.signal}).catch(()=>abortIfNeeded(lease.signal));
         }
+        if(preparedNext)continue;
         if(!next || session.loaderId+'|'+next.structure===before)return {status:'needs-user',reason:'AUTHENTICATION_RETRY_REQUIRED'};
         if(!next.challenge)return {status:'needs-user',reason:'VERIFICATION_REQUIRED'};
-        await callPage(session,adaptivePage,[session.stateKey,session.planKey,'prepare',{method:'password'}],lease.signal);
+        return {status:'needs-user',reason:prepareError||'AUTHENTICATION_RETRY_REQUIRED'};
       }
       return {status:'needs-user',reason:'FLOW_TIMEOUT'};
     }finally{values=undefined;credentials=undefined;}
