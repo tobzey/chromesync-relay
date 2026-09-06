@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
+import { setTimeout as delay } from 'node:timers/promises';
 import { importAuthenticatedSession } from '../auth/session-handoff.js';
 import { profilePaths } from '../cli/config.js';
 import { connectProfile } from '../cli/browser.js';
@@ -17,7 +18,14 @@ const bundle = overrides => ({ version: 1, accountKey: 'synthetic-account-key', 
 
 function fixture(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'chromesync-handoff-'));
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  let beforeRemove = async () => {};
+  t.after(async () => {
+    // Resource cleanup is one hook: a profile-removal error must not skip a
+    // later server-close hook and keep the test worker alive. Preserve files
+    // if browser shutdown cannot be verified.
+    await beforeRemove();
+    await fs.promises.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
   const home = path.join(directory, 'authentication');
   const calls = [], cookies = new Map();
   let failure, dropReadback = false, ignoreDelete = false, targets = [];
@@ -44,7 +52,18 @@ function fixture(t) {
   };
   const run = (value = bundle(), name = 'work') => importAuthenticatedSession({ home, name, headless: true, bundle: value }, dependencies);
   return { directory, home, calls, cookies, dependencies, run,
+    beforeRemove(operation) { beforeRemove = operation; },
     setFailure(value) { failure = value; }, setDropReadback(value) { dropReadback = value; }, setIgnoreDelete(value) { ignoreDelete = value; } };
+}
+
+async function waitForBrowserExit(pid) {
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    try { process.kill(pid, 0); }
+    catch (error) { if (error.code === 'ESRCH') return; throw error; }
+    await delay(25);
+  }
+  throw new Error('Disposable Chrome did not exit after Browser.close');
 }
 
 test('session handoff validates origin, account, size and every cookie before profile writes or launch', async t => {
@@ -155,34 +174,56 @@ test('real managed receiver accepts only the imported synthetic cookie session',
   const chrome = process.env.CHROMESYNC_TEST_CHROME;
   assert.ok(chrome && fs.existsSync(chrome), 'Explicit handoff E2E requires the configured test browser');
   const previous = process.env.CHROMESYNC_CHROME;
-  process.env.CHROMESYNC_CHROME = chrome;
-  t.after(() => { if (previous === undefined) delete process.env.CHROMESYNC_CHROME; else process.env.CHROMESYNC_CHROME = previous; });
   let accepted;
   const requested = new Promise(resolve => { accepted = resolve; });
   const server = createServer((request, response) => {
     if (request.url === '/account' && request.headers.cookie?.includes(`session=${SECRET}`)) { response.end('Synthetic session accepted'); accepted(); }
     else { response.writeHead(401); response.end('No synthetic session'); }
   });
+  let result, client;
+  f.beforeRemove(async () => {
+    try {
+      if (!client && result?.profileName) client = (await connectProfile(path.join(f.home, 'received'), result.profileName)).client;
+      if (client) {
+        let pid;
+        try {
+          // connectProfile already checked this CDP connection's exact fresh
+          // user-data directory. Never discover or signal unrelated processes.
+          const { processInfo } = await client.send('SystemInfo.getProcessInfo', {}, { timeoutMs: 2000 });
+          const browsers = processInfo.filter(process => process.type === 'browser');
+          assert.equal(browsers.length, 1, 'the disposable connection identifies one browser process');
+          pid = browsers[0].id;
+          assert.ok(Number.isSafeInteger(pid) && pid > 0, 'the disposable browser has a valid process ID');
+        } finally {
+          await client.send('Browser.close', {}, { timeoutMs: 2000 }).catch(() => {});
+          client.close();
+        }
+        await waitForBrowserExit(pid);
+      }
+    } finally {
+      try {
+        const closed = new Promise((resolve, reject) => server.close(error => error && error.code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve()));
+        server.closeAllConnections();
+        await closed;
+      } finally {
+        if (previous === undefined) delete process.env.CHROMESYNC_CHROME; else process.env.CHROMESYNC_CHROME = previous;
+      }
+    }
+  });
+  process.env.CHROMESYNC_CHROME = chrome;
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
-  t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
   const origin = `http://localhost:${server.address().port}`;
-  const result = await importAuthenticatedSession({ home: f.home, headless: true, bundle: bundle({ origin, url: `${origin}/account`,
+  result = await importAuthenticatedSession({ home: f.home, headless: true, bundle: bundle({ origin, url: `${origin}/account`,
     cookies: [{ ...bundle().cookies[0], domain: 'localhost', secure: false }] }), testing: { allowLoopbackHttp: true } });
-  let client;
-  try {
-    assert.equal(result.status, 'imported');
-    const connection = await connectProfile(path.join(f.home, 'received'), result.profileName);
-    client = connection.client;
-    assert.equal(connection.wsUrl, result.endpoint);
-    let timeout;
-    try { await Promise.race([requested, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('Imported browser did not reach the synthetic account')), 10000); })]); }
-    finally { clearTimeout(timeout); }
-    const readback = await client.send('Storage.getCookies');
-    assert.equal(readback.cookies.find(cookie => cookie.name === 'session')?.value, SECRET);
-    assert.equal(JSON.stringify(result).includes(SECRET), false);
-    assert.equal(fs.readFileSync(path.join(f.home, 'received', 'profiles', result.profileName, 'session.json'), 'utf8').includes(SECRET), false);
-  } finally {
-    if (!client && result.profileName) client = await connectProfile(path.join(f.home, 'received'), result.profileName).then(value => value.client, () => undefined);
-    if (client) { await client.send('Browser.close').catch(() => {}); client.close(); }
-  }
+  assert.equal(result.status, 'imported');
+  const connection = await connectProfile(path.join(f.home, 'received'), result.profileName);
+  client = connection.client;
+  assert.equal(connection.wsUrl, result.endpoint);
+  let timeout;
+  try { await Promise.race([requested, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('Imported browser did not reach the synthetic account')), 10000); })]); }
+  finally { clearTimeout(timeout); }
+  const readback = await client.send('Storage.getCookies');
+  assert.equal(readback.cookies.find(cookie => cookie.name === 'session')?.value, SECRET);
+  assert.equal(JSON.stringify(result).includes(SECRET), false);
+  assert.equal(fs.readFileSync(path.join(f.home, 'received', 'profiles', result.profileName, 'session.json'), 'utf8').includes(SECRET), false);
 });

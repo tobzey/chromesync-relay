@@ -2,6 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { createConnection } from 'node:net';
 import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -16,7 +17,7 @@ test('adaptive browser binds live fields, completes password/TOTP, verifies acco
   skip:enabled?false:'Set CHROMESYNC_AUTH_BROWSER_E2E=1 for disposable browser tests',timeout:120000,
 },async t=>{
   const directory=await mkdtemp(path.join(tmpdir(),'chromesync-adaptive-'));
-  const states=new Map();let passwordPosts=0,otpPosts=0;
+  const states=new Map();let passwordPosts=0,otpPosts=0,unusedConnection;
   const server=createServer(async(req,res)=>{
     const old=/session=([a-f0-9-]+)/.exec(req.headers.cookie||'')?.[1];
     const sid=old&&states.has(old)?old:randomUUID();
@@ -56,7 +57,19 @@ test('adaptive browser binds live fields, completes password/TOTP, verifies acco
   server.listen(0,'127.0.0.1');await once(server,'listening');
   const origin=`http://localhost:${server.address().port}`;
   const controller=createBrowserController({chromePath:process.env.CHROMESYNC_TEST_CHROME,profileRoot:directory,testing:{allowLoopbackHttp:true}});
-  t.after(async()=>{await controller.close();await new Promise(resolve=>server.close(resolve));await rm(directory,{recursive:true,force:true});});
+  t.after(async()=>{
+    try {await controller.close();}
+    finally {
+      try {
+        await new Promise(resolve=>{
+          server.close(resolve);
+          // Chrome may preconnect without sending an HTTP request. Such
+          // sockets are not released by server.close's idle-request cleanup.
+          server.closeAllConnections();
+        });
+      } finally {unusedConnection?.destroy();await rm(directory,{recursive:true,force:true});}
+    }
+  });
   let serial=0;
   const discover=async(pathname='/login')=>{
     const session=await controller.openDiscoverySession(origin+pathname,'agent');
@@ -192,4 +205,8 @@ test('adaptive browser binds live fields, completes password/TOTP, verifies acco
   let signing=0;
   assert.deepEqual(await controller.withAuthenticationLease(passkeyRequest,sink=>sink({passkey:async()=>{signing++;return {completed:true,method:'passkey'};}})),{status:'authenticated'});
   assert.equal(signing,1);assert.equal((await controller.exportSession(passkey.id,'agent')).origin,origin);
+  // Keep an unused preconnection alive through teardown. Without explicitly
+  // closing fixture connections, the after hook would wait indefinitely.
+  unusedConnection=createConnection({host:'127.0.0.1',port:server.address().port});
+  await once(unusedConnection,'connect');
 });
