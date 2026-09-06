@@ -64,7 +64,16 @@ async function setup(home, values) {
 }
 
 async function main() {
-  const { values, positionals } = parseArgs({ allowPositionals: true, options: {
+  const args = process.argv.slice(2);
+  // Generated 32-byte base64url device IDs may begin with '-' or '--'. Keep
+  // the documented --device ID form usable without accepting real options as
+  // missing values or weakening strict parsing for any other argument.
+  for (let i = 0; i < args.length && args[i] !== '--'; i++) {
+    if (args[i] === '--device' && /^-[A-Za-z0-9_-]{42}$/.test(args[i + 1] || '')) {
+      args.splice(i, 2, `--device=${args[i + 1]}`);
+    }
+  }
+  const { values, positionals } = parseArgs({ args, allowPositionals: true, options: {
     source: { type: 'string' }, interactive: { type: 'boolean' }, 'extension-id': { type: 'string' },
     name: { type: 'string' }, role: { type: 'string' }, relay: { type: 'string' }, domains: { type: 'string' },
     'request-file': { type: 'string' }, 'activation-file': { type: 'string' }, fingerprint: { type: 'string' }, device: { type: 'string' },

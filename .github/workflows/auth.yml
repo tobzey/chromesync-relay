@@ -80,8 +80,12 @@ jobs:
           else
             browser="$RUNNER_TEMP/chromesync-cft/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
           fi
-          actual_version="$("$browser" --version)"
-          test "$actual_version" = "Google Chrome for Testing $CFT_VERSION"
+          # CfT appends a space before its newline; shell substitution keeps it.
+          actual_version="$("$browser" --version | sed 's/[[:space:]]*$//')"
+          if [ "$actual_version" != "Google Chrome for Testing $CFT_VERSION" ]; then
+            printf 'Unexpected Chrome version: %s\n' "$actual_version" >&2
+            exit 1
+          fi
           printf 'CHROMESYNC_TEST_CHROME=%s\n' "$browser" >> "$GITHUB_ENV"
       - name: Permit the verified Linux browser to create its sandbox
         if: runner.os == 'Linux'

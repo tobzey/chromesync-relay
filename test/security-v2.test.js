@@ -196,3 +196,34 @@ test('CLI commands complete per-device pairing and revocation without exposing p
   assert.equal(run(sourceHome, 'revoke', '--name', 'work', '--device', approved.deviceId).status, 'revoked');
   assert.equal(run(sourceHome, 'devices', '--name', 'work').length, 0);
 });
+
+test('CLI revokes generated device IDs beginning with dashes and still rejects missing values', async t => {
+  const { spawnSync } = await import('node:child_process');
+  for (const prefix of ['-', '--']) {
+    const { sourceHome, source, result } = await paired(t);
+    const deviceId = prefix + 'A'.repeat(43 - prefix.length);
+    const vault = loadCredentials(source.secretRef);
+    const channel = vault.channels[result.deviceId];
+    delete vault.channels[result.deviceId];
+    vault.channels[deviceId] = { ...channel, deviceId };
+    for (const item of Object.values(vault.approvalOutbox)) item.deviceId = deviceId;
+    storeCredentials(source.secretRef, vault);
+    const pending = path.join(sourceHome, 'profiles', source.name,
+      `pending-${crypto.createHash('sha256').update(deviceId).digest('hex')}.json`);
+    fs.writeFileSync(pending, 'synthetic pending ciphertext');
+    const run = (...args) => spawnSync(process.execPath,
+      ['--import', './test/keychain-fixture.js', 'cli/index.js', 'revoke', '--name', source.name, ...args],
+      { env: { ...process.env, CHROMESYNC_HOME: sourceHome }, encoding: 'utf8' });
+
+    const missing = run('--device', '--json');
+    assert.equal(missing.status, 1);
+    assert.ok(loadCredentials(source.secretRef).channels[deviceId]);
+    const revoked = run('--device', deviceId, '--json');
+    assert.equal(revoked.status, 0, revoked.stderr);
+    assert.equal(JSON.parse(revoked.stdout).status, 'revoked');
+    assert.equal(loadCredentials(source.secretRef).channels[deviceId], undefined);
+    assert.deepEqual(loadCredentials(source.secretRef).approvalOutbox, {});
+    assert.equal(fs.existsSync(pending), false);
+    assert.ok(!revoked.stdout.includes(channel.token));
+  }
+});
