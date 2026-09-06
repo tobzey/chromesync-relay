@@ -7,19 +7,21 @@ let savedProviders, providerRevision = 0, providerRenderKey;
 const preferences = new Map();
 const pages = Object.fromEntries(['requests', 'policies', 'services'].map(name => [name, { cursor: null, history: [] }]));
 let requestRenderKey;
+let captureController;
+const closedSessionGuidance = 'The protected browser for this request is no longer open. Ask the agent to open a new session and request again.';
 let activeTakeover, captureBusy = false, capturePromise, captureTimer, actionPending = false;
 const $ = selector => document.querySelector(selector);
 function element(tag, text, className) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; }
 function notice(text) { $('#notice').textContent = text; $('#notice').hidden = false; }
-async function call(operation, args = {}, { timeoutMs, allowFailed = false } = {}) {
+async function call(operation, args = {}, { timeoutMs, allowFailed = false, signal } = {}) {
   if (/^(takeover|passkey)\./.test(operation)) timeoutMs ??= 30000;
   const controller = timeoutMs ? new AbortController() : undefined;
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
   try {
-    const response = await fetch('/api', { method: 'POST', headers: { 'content-type': 'application/json', 'x-csrf-token': csrf }, body: JSON.stringify({ operation, args }), signal: controller?.signal });
+    const response = await fetch('/api', { method: 'POST', headers: { 'content-type': 'application/json', 'x-csrf-token': csrf }, body: JSON.stringify({ operation, args }), signal: signal && controller ? AbortSignal.any([signal, controller.signal]) : signal || controller?.signal });
     const body = await response.json();
-    if (!response.ok || body.result?.status === 'uncertain') throw new Error((body.error ? `${body.error}${/^[A-Z_]{1,40}$/.test(body.code || '') ? ` (${body.code})` : ''}` : '') || 'The executor has not confirmed the result. Check its status before trying again.');
-    if (body.result?.status === 'failed' && !allowFailed) throw new Error(`The executor could not complete this request (${body.result.reason || 'failed'}).`);
+    if (!response.ok || body.result?.status === 'uncertain') throw Object.assign(new Error((body.error ? `${body.error}${/^[A-Z_]{1,40}$/.test(body.code || '') ? ` (${body.code})` : ''}` : '') || 'The executor has not confirmed the result. Check its status before trying again.'), { code: body.code });
+    if (body.result?.status === 'failed' && !allowFailed) throw Object.assign(new Error(`The executor could not complete this request (${body.result.reason || 'failed'}).`), { code: body.result.reason });
     return body.result;
   } catch (error) {
     if (controller?.signal.aborted) throw new Error('The executor did not respond in time. Its connection state is unknown.');
@@ -47,13 +49,21 @@ function renderPages(view, page, selector) {
 }
 const seenRequestIds = new Set();
 let audioContext;
+function notificationSummary(page) {
+  if (page.pendingSummary === undefined) return page.items.filter(row => row.status === 'pending');
+  const rows = page.pendingSummary;
+  if (!Array.isArray(rows) || rows.length > 20 || new TextEncoder().encode(JSON.stringify(rows)).length > 8192 ||
+      rows.some(row => !row || typeof row.requestId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(row.requestId) ||
+        typeof row.name !== 'string' || typeof row.origin !== 'string' || !Number.isSafeInteger(row.expiresAt) || row.expiresAt < 0 ||
+        Object.keys(row).some(key => !['requestId', 'name', 'origin', 'expiresAt'].includes(key)))) throw new Error('Pending notification summary is unavailable.');
+  return rows;
+}
 function notifyRequests(requests, openCount) {
   for (const request of requests) {
     const id = request.requestId || request.id;
     if (seenRequestIds.has(id)) continue;
     seenRequestIds.add(id);
     if (seenRequestIds.size > 10000) seenRequestIds.delete(seenRequestIds.values().next().value);
-    if (request.status !== 'pending') continue;
     if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
       try {
         const notification = new Notification('Approval needed', { body: `${request.name || request.serviceId} · ${request.origin}`, tag: id, requireInteraction: true });
@@ -95,7 +105,6 @@ function failureText(request) {
   return messages[request.diagnostic?.code] || 'Authentication did not complete. Review the service connection, then retry or complete it in the protected browser.';
 }
 function renderRequests(requests, hasMore, openCount = requests.length) {
-  notifyRequests(requests, openCount);
   $('#count').textContent = String(openCount);
   document.title = openCount ? `(${openCount}) ChromeSync approvals` : 'ChromeSync approvals';
   const key = JSON.stringify([requests, hasMore, openCount]);
@@ -273,6 +282,7 @@ function refresh() {
   const work = [refreshProviders()];
   if (!activeTakeover) {
     work.push(refreshComponent('requests', 'requests', { cursor: pages.requests.cursor }, page => {
+      notifyRequests(notificationSummary(page), page.openCount ?? page.items.length);
       renderRequests(page.items, page.hasMore, Number.isSafeInteger(page.openCount) && page.openCount >= 0 ? page.openCount : page.items.length); renderPages('requests', page, '#request-pages');
     }, '#request-status'));
     if (currentView === 'policies') work.push(refreshComponent('policies', 'policies', { cursor: pages.policies.cursor }, page => {
@@ -299,6 +309,7 @@ document.querySelectorAll('[data-view]').forEach(button => button.addEventListen
 }));
 window.addEventListener('hashchange', () => { if (!activeTakeover) { selectView(viewFromHash()); refresh(); } });
 selectView(currentView);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refresh(); });
 function capture() {
   if (!activeTakeover || captureBusy || actionPending) return Promise.resolve();
   clearTimeout(captureTimer);
@@ -308,12 +319,13 @@ function capture() {
 async function performCapture() {
   let retryDelay = 1500;
   captureBusy = true;
+  const interaction = activeTakeover;
+  const controller = new AbortController(); captureController = controller;
   try {
-    const interaction = activeTakeover;
     const view = interaction.mode === 'receiver'
-      ? await call('passkey.observe', { requestId: interaction.requestId, targetHandle: interaction.chosenTargetHandle })
-      : await call('takeover.observe', { takeoverId: interaction.takeoverId });
-    if (activeTakeover !== interaction) return;
+      ? await call('passkey.observe', { requestId: interaction.requestId, targetHandle: interaction.chosenTargetHandle }, { signal: controller.signal })
+      : await call('takeover.observe', { takeoverId: interaction.takeoverId }, { signal: controller.signal });
+    if (controller.signal.aborted || activeTakeover !== interaction) return;
     $('#takeover-status').textContent = '';
     if (Number.isSafeInteger(view.expiresAt)) activeTakeover.expiresAt = view.expiresAt;
     activeTakeover.width = view.width; activeTakeover.height = view.height;
@@ -325,10 +337,18 @@ async function performCapture() {
       for (const target of view.targets) { const option = element('option', target.label); option.value = target.handle; option.selected = target.handle === view.targetHandle; select.append(option); }
     }
   } catch (error) {
+    if (controller.signal.aborted || activeTakeover !== interaction) return;
+    if (['SESSION_CLOSED', 'SESSION_NOT_FOUND', 'TAKEOVER_NOT_FOUND', 'session-closed'].includes(error.code)) {
+      leaveInteraction(); notice(closedSessionGuidance); await refresh(); return;
+    }
+    if (Number.isFinite(interaction.expiresAt) && interaction.expiresAt <= Date.now()) {
+      leaveInteraction(); notice('The protected browser interaction expired. Open the request again to continue.'); await refresh(); return;
+    }
     retryDelay = 5000;
     $('#takeover-status').textContent = 'Waiting for the protected browser…';
     if (activeTakeover?.mode === 'receiver') {
-      const status = await call('request.status', { requestId: activeTakeover.requestId }, { timeoutMs: 5000 }).catch(() => null);
+      const status = await call('request.status', { requestId: activeTakeover.requestId }, { timeoutMs: 5000, signal: controller.signal }).catch(() => null);
+      if (controller.signal.aborted || activeTakeover !== interaction) return;
       if (status && !['pending', 'approved', 'authenticating'].includes(status.status)) {
         leaveInteraction();
         notice(status.status === 'succeeded' ? 'Authentication verified. The agent can continue.' : 'The ceremony ended without verified authentication. Review the request to continue.');
@@ -339,7 +359,7 @@ async function performCapture() {
       }
     }
   }
-  finally { captureBusy = false; if (activeTakeover) captureTimer = setTimeout(capture, retryDelay); }
+  finally { if (captureController === controller) captureController = undefined; captureBusy = false; if (activeTakeover && !actionPending) captureTimer = setTimeout(capture, retryDelay); }
 }
 async function beginTakeover(requestId) {
   const result = await call('takeover.start', { requestId }, { allowFailed: true });
@@ -370,6 +390,7 @@ function showInteraction() {
 async function takeoverAction(operation, args = {}) {
   if (!activeTakeover || actionPending) return;
   actionPending = true; clearTimeout(captureTimer);
+  captureController?.abort();
   await capturePromise;
   if (!activeTakeover) { actionPending = false; return; }
   captureBusy = true;
@@ -396,6 +417,7 @@ for (const [selector, key] of [['#takeover-tab', 'Tab'], ['#takeover-enter', 'En
 $('#receiver-target').addEventListener('change', () => { if (activeTakeover?.mode === 'receiver') { activeTakeover.chosenTargetHandle = $('#receiver-target').value; capture(); } });
 $('#takeover-refresh').addEventListener('click', capture);
 function leaveInteraction() {
+  captureController?.abort();
   clearTimeout(captureTimer);
   $('#takeover-status').textContent = '';
   activeTakeover = undefined; $('#takeover-image').removeAttribute('src'); $('#takeover-text').value = ''; $('#takeover').hidden = true;
@@ -405,6 +427,7 @@ function leaveInteraction() {
 async function finishTakeover(cancel) {
   if (!activeTakeover || actionPending) return;
   actionPending = true; clearTimeout(captureTimer);
+  captureController?.abort();
   await capturePromise;
   if (!activeTakeover) { actionPending = false; return; }
   const adaptive = activeTakeover.mode === 'source' && activeTakeover.adaptive === true;

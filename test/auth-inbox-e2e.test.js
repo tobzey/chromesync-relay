@@ -14,19 +14,22 @@ const enabled=process.env.CHROMESYNC_AUTH_BROWSER_E2E==='1';
 const JPEG='/9j/4AAQSkZJRgABAQAAAQABAAD/4gHYSUNDX1BST0ZJTEUAAQEAAAHIAAAAAAQwAABtbnRyUkdCIFhZWiAH4AABAAEAAAAAAABhY3NwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAA9tYAAQAAAADTLQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAlkZXNjAAAA8AAAACRyWFlaAAABFAAAABRnWFlaAAABKAAAABRiWFlaAAABPAAAABR3dHB0AAABUAAAABRyVFJDAAABZAAAAChnVFJDAAABZAAAAChiVFJDAAABZAAAAChjcHJ0AAABjAAAADxtbHVjAAAAAAAAAAEAAAAMZW5VUwAAAAgAAAAcAHMAUgBHAEJYWVogAAAAAAAAb6IAADj1AAADkFhZWiAAAAAAAABimQAAt4UAABjaWFlaIAAAAAAAACSgAAAPhAAAts9YWVogAAAAAAAA9tYAAQAAAADTLXBhcmEAAAAAAAQAAAACZmYAAPKnAAANWQAAE9AAAApbAAAAAAAAAABtbHVjAAAAAAAAAAEAAAAMZW5VUwAAACAAAAAcAEcAbwBvAGcAbABlACAASQBuAGMALgAgADIAMAAxADb/2wBDACAWGBwYFCAcGhwkIiAmMFA0MCwsMGJGSjpQdGZ6eHJmcG6AkLicgIiuim5woNqirr7EztDOfJri8uDI8LjKzsb/2wBDASIkJDAqMF40NF7GhHCExsbGxsbGxsbGxsbGxsbGxsbGxsbGxsbGxsbGxsbGxsbGxsbGxsbGxsbGxsbGxsbGxsbGxsb/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAb/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFAEBAAAAAAAAAAAAAAAAAAAAAP/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AKAAH//Z';
 
 test('approval inbox preserves factor choices, paginates, and privately drives an asynchronous passkey prompt',
-  {skip:enabled?false:'Set CHROMESYNC_AUTH_BROWSER_E2E=1 for the disposable approval inbox browser test.',timeout:60000},async()=>{
+  {skip:enabled?false:'Set CHROMESYNC_AUTH_BROWSER_E2E=1 for the disposable approval inbox browser test.',timeout:90000},async()=>{
     const profileRoot=await mkdtemp(path.join(tmpdir(),'chromesync-inbox-e2e-'));
     const protectedText='SYNTHETIC_PROVIDER_UNLOCK_92734';
-    const calls=[]; let sourceFrames = 0, sourceFailure = false;
+    const calls=[]; let sourceFrames = 0, sourceFailure = false, terminal = false, stall, releaseCapture, newPending;
     const password={requestId:'password-request',serviceId:'work',name:'Work workspace',accountId:'Work account',requesterId:'synthetic-agent',
       origin:'https://accounts.example.test',purpose:'reauthentication',factors:['password','totp'],status:'pending'};
     const passkey={requestId:'passkey-request',serviceId:'passkeys',name:'Passkey workspace',accountId:'Passkey account',requesterId:'synthetic-agent',
       origin:'https://passkeys.example.test',purpose:'login',factors:['passkey'],status:'pending'};
     const inbox=await startApprovalInbox({call:async(operation,args)=>{
       calls.push({operation,args:structuredClone(args)});
-      if(operation==='requests') return args.cursor==='synthetic-page-2'
-        ? {openCount:2,items:passkey.status==='succeeded'?[]:[structuredClone(passkey)],nextCursor:null,hasMore:false}
-        : {openCount:2,items:[structuredClone(password)],nextCursor:'synthetic-page-2',hasMore:true};
+      if(operation==='requests') {
+        const pendingSummary = [newPending, password, passkey].filter(row => row?.status === 'pending').map(({requestId,name,origin}) => ({requestId,name,origin,expiresAt:Date.now()+60000}));
+        return args.cursor==='synthetic-page-2'
+          ? {pendingSummary,openCount:2,items:passkey.status==='succeeded'?[]:[structuredClone(passkey)],nextCursor:null,hasMore:false}
+          : {pendingSummary,openCount:2,items:[...(newPending ? [newPending] : []),structuredClone(password)],nextCursor:'synthetic-page-2',hasMore:true};
+      }
       if(['policies','enrollments'].includes(operation)) return {items:[],nextCursor:null,hasMore:false};
       if(['peers','providers'].includes(operation)) return [];
       if(operation==='request.decide') {
@@ -41,8 +44,9 @@ test('approval inbox preserves factor choices, paginates, and privately drives a
         return{origin:passkey.origin,format:'jpeg',image:JPEG,width:1,height:1,targetHandle:'synthetic-provider-target',
           targets:[{handle:'synthetic-provider-target',label:'1Password provider fixture'}]};
       }
-      if(operation==='takeover.start') return { takeoverId: 'synthetic-takeover' };
-      if(operation==='takeover.observe') { sourceFrames++; if (sourceFailure) return { status: 'uncertain' }; return { format: 'jpeg', image: JPEG, width: 1, height: 1, origin: password.origin }; }
+      if(operation==='takeover.start') return { takeoverId: 'synthetic-takeover', expiresAt: terminal === 'expired' ? Date.now()-1 : Date.now()+60000 };
+      if(operation==='takeover.observe') { sourceFrames++; if (stall) await stall; if (terminal === 'result') return {status:'failed',reason:'session-closed'}; if (terminal === 'expired') return {status:'uncertain'}; if (terminal) throw Object.assign(new Error('Synthetic session closed'), {code:terminal === true ? 'SESSION_CLOSED' : terminal}); if (sourceFailure) return { status: 'uncertain' }; return { format: 'jpeg', image: JPEG, width: 1, height: 1, origin: password.origin }; }
+      if(operation==='takeover.key') return {status:'ok'};
       if(operation==='takeover.finish') return { status: 'needs-user' };
       if(operation==='passkey.type') return{status:'ok'};
       throw new Error(`Unexpected fixture operation: ${operation}`);
@@ -97,7 +101,7 @@ test('approval inbox preserves factor choices, paginates, and privately drives a
       await send('Page.addScriptToEvaluateOnNewDocument', { source: `window.notifications=[]; window.Notification=class { static permission='granted'; constructor(title,options){window.notifications.push({title,...options});} };` });
       await send('Page.navigate',{url:inbox.url});
       await until(()=>page(()=>document.querySelector('#request-list h2')?.textContent==='Work workspace'),'initial request rendered');
-      assert.deepEqual(await page(() => window.notifications.map(n => n.tag)), ['password-request']);
+      assert.deepEqual(await page(() => window.notifications.map(n => n.tag)), ['password-request', 'passkey-request']);
       assert.equal(await page(() => document.title), '(2) ChromeSync approvals');
       const ax=await send('Accessibility.getFullAXTree');
       assert.ok(ax.nodes.some(node=>node.role?.value==='button'&&node.name?.value==='Next page'),'pagination is an accessible button');
@@ -114,6 +118,15 @@ test('approval inbox preserves factor choices, paginates, and privately drives a
       await until(()=>page(()=>document.querySelector('#request-list h2')?.textContent==='Passkey workspace'),'next page rendered');
       assert.deepEqual(await page(() => window.notifications.map(n => n.tag)), ['password-request', 'passkey-request']);
       assert.ok((await send('Accessibility.getFullAXTree')).nodes.some(node=>node.role?.value==='button'&&node.name?.value==='Previous page'));
+      newPending = {...password, requestId:'new-on-page-one', name:'New approval'};
+      await until(() => page(() => window.notifications.some(n => n.tag === 'new-on-page-one')), 'new page-one request notifies while page two is selected');
+      assert.equal(await page(() => document.querySelector('#request-list h2').textContent), 'Passkey workspace');
+      const beforeVisible = calls.filter(row => row.operation === 'requests').length;
+      await page(() => { Object.defineProperty(document, 'visibilityState', { configurable:true, value:'visible' }); document.dispatchEvent(new Event('visibilitychange')); });
+      await until(() => calls.filter(row => row.operation === 'requests').length > beforeVisible, 'visibility change refreshes immediately', 1000);
+      assert.equal(await page(() => window.notifications.filter(n => n.tag === 'new-on-page-one').length), 1);
+      newPending = undefined;
+
       await click('#request-pages button','Previous page');
       assert.equal(await page(()=>document.querySelector('input[value="totp"]').checked),false);
       assert.equal(await page(()=>document.querySelector('#request-list select').value),'1');
@@ -128,7 +141,27 @@ test('approval inbox preserves factor choices, paginates, and privately drives a
       await until(() => page(() => document.querySelector('#takeover-status').textContent.includes('Waiting for the protected browser')), 'source failure has a non-blocking waiting state', 4000);
       sourceFailure = false;
       await until(() => page(() => document.querySelector('#takeover-status').textContent === ''), 'source mode recovers after backoff', 6500);
-      await click('#takeover-cancel');
+      stall = new Promise(resolve => { releaseCapture = resolve; });
+      const beforeStall = sourceFrames;
+      await until(() => sourceFrames > beforeStall, 'capture is held');
+      const actionStarted = Date.now();
+      await page(() => document.querySelector('#takeover-tab').click());
+      await until(() => calls.some(row => row.operation === 'takeover.key'), 'action bypasses held capture', 1000);
+      assert(Date.now() - actionStarted < 1000);
+      terminal = true; stall = undefined; releaseCapture();
+      await until(() => page(() => document.querySelector('#takeover').hidden), 'terminal observe closes view');
+      assert.equal(await page(() => document.querySelector('#notice').textContent), 'The protected browser for this request is no longer open. Ask the agent to open a new session and request again.');
+      const terminalFrames = sourceFrames;
+      await delay(5500);
+      assert.equal(sourceFrames, terminalFrames, 'no observation retries after terminal close');
+      for (const ending of ['SESSION_NOT_FOUND', 'TAKEOVER_NOT_FOUND', 'result', 'expired']) {
+        terminal = ending;
+        await click('#request-list button','Complete in protected browser');
+        await until(() => page(() => document.querySelector('#takeover').hidden), 'terminal or expired view closes');
+        assert.match(await page(() => document.querySelector('#notice').textContent), ending === 'expired' ? /interaction expired/ : /no longer open/);
+      }
+
+
       await click('#request-pages button','Next page');
       await click('#request-list button','Allow once');
       await until(()=>page(()=>!document.querySelector('#takeover').hidden&&document.querySelector('#takeover-status').textContent.includes('Waiting for the 1Password prompt')),'approved ceremony opens provider view while waiting');
@@ -157,9 +190,9 @@ test('approval inbox preserves factor choices, paginates, and privately drives a
       assert.equal(await page(()=>document.querySelector('#takeover-image').hasAttribute('src')),false);
       assert.deepEqual(exceptions,[]);
       assert.deepEqual(consoleErrors,[]);
-      assert.equal(resourceErrors.filter(error=>error.url.endsWith('/api')&&error.status===400).length,2,'only intentional provider-not-ready and completed-ceremony errors');
+      assert.equal(resourceErrors.filter(error=>error.url.endsWith('/api')&&error.status===400).length,5,'only intentional closed-session and provider ceremony errors');
       assert.deepEqual(resourceErrors.filter(error=>!error.url.endsWith('/favicon.ico')&&!(error.url.endsWith('/api')&&error.status===400)),[]);
     }finally{
-      await browser?.close();await inbox.close();await rm(profileRoot,{recursive:true,force:true});
+      releaseCapture?.();await browser?.close();await inbox.close();await rm(profileRoot,{recursive:true,force:true});
     }
   });
