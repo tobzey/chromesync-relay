@@ -169,16 +169,20 @@ export async function launchManagedChrome({chromePath, profileRoot, headless = t
   process.on('exit', () => connection.close());
   const close = async () => {
     connection.close();
+    try {
     if (process.exitCode === null && process.signalCode === null) {
       const exited = new Promise(resolve => process.once('exit', resolve));
-      process.kill('SIGTERM');
+      try { process.kill('SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
       await Promise.race([exited, delay(3000)]);
       if (process.exitCode === null && process.signalCode === null) {
-        process.kill('SIGKILL');
+        try { process.kill('SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
         await Promise.race([exited, delay(1000)]);
       }
     }
+      if (process.exitCode === null && process.signalCode === null) throw new BrowserControllerError('BROWSER_CLOSE_FAILED');
+    } finally {
     if (!persistent) await rm(profilePath, {recursive:true,force:true,maxRetries:5,retryDelay:100});
+    }
   };
   try { await connection.send('Browser.getVersion',{},undefined,{signal}); }
   catch (error) { await close(); throw error; }

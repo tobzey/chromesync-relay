@@ -51,7 +51,9 @@ export async function createAuthExecutor({ home, controller: suppliedController,
   const state = await store.read();
   const passkeys = suppliedPasskeys || (suppliedController ? null : await createManagedPasskeyProvider({ home }));
   const discoverySessions = new Map();
-  const controller = suppliedController || (await import('./browser/controller.js')).createBrowserController({
+  let controller = suppliedController;
+  try {
+  controller ||= (await import('./browser/controller.js')).createBrowserController({
     profileRoot: path.join(home, 'browsers'),
     services: state.enrollments.map(entry => ({ ...entry, id: entry.serviceId })),
     chromePath: passkeys?.chromePath,
@@ -419,8 +421,16 @@ export async function createAuthExecutor({ home, controller: suppliedController,
   const relay = createRelayExecutor({ identity: secrets.identity, getPeers: async () => (await getSecrets()).peers, store, dispatch, isReadOnly: operation => readOnly.has(operation), io });
   return { broker, store, controller, dispatch, poll: () => closing ? { status: 'stopping' } : relay.poll(), close: () => closePromise ||= (async () => {
     closing = true; takeovers.clear(); discoverySessions.clear();
-    await broker.drain({ abort: true }); await controller.close(); await passkeys?.close(); await relay.drain();
-  })() };
+    const errors = [];
+    for (const release of [() => broker.drain({ abort: true }), () => controller.close(), () => passkeys?.close(), () => relay.drain()]) {
+      try { await release(); } catch (error) { errors.push(error); }
+    }
+    if (errors.length) throw new AggregateError(errors, 'Executor cleanup incomplete');
+  })().catch(error => { closePromise = undefined; throw error; }) };
+  } catch (error) {
+    await Promise.allSettled([Promise.resolve().then(() => controller?.close()), Promise.resolve().then(() => passkeys?.close())]);
+    throw error;
+  }
 }
 
 export function createAuthRemote(home, options = {}) {

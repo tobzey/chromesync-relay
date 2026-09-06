@@ -14,8 +14,9 @@ const snapshotMatches = (expected, actual) => expected.id === actual.id && expec
 
 export function createBrowserController({chromePath, profileRoot, services = [], headless = true,
   extensionPaths = [], prepareProfile, testing = {}, maxSessions = 8,
-  maxSessionsPerRequester = Math.min(4,maxSessions)} = {}) {
+  maxSessionsPerRequester = Math.min(4,maxSessions), idleTimeoutMs = 15 * 60000, launchBrowser = launchManagedChrome} = {}) {
   validateProfileRoot(profileRoot);
+  if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < 1) fail('INVALID_CONFIGURATION');
   if (typeof headless !== 'boolean') fail('INVALID_CONFIGURATION');
   if (!Number.isInteger(maxSessions) || maxSessions<1 || maxSessions>32 ||
       !Number.isInteger(maxSessionsPerRequester) || maxSessionsPerRequester<1 || maxSessionsPerRequester>maxSessions) {
@@ -23,6 +24,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
   }
   const serviceMap = new Map();
   const sessions = new Map();
+  const closingSessions = new Map();
   // Reserve before the first asynchronous operation. Closing browsers continue
   // to count until cleanup finishes, so neither concurrent opens nor close/open
   // races can temporarily exceed the process limit.
@@ -41,6 +43,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
     if (typeof id === 'object') id = id?.id;
     const session = sessions.get(id);
     if (!session || session.closed || session.ownerId !== requesterId) fail('SESSION_NOT_FOUND', 'The browser session is not available.');
+    session.lastActivityAt = Date.now();
     return session;
   }
 
@@ -63,7 +66,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
     if (session.quarantined && !allowQuarantined) fail('AUTHENTICATION_REQUIRED', 'This browser needs a trusted authentication retry or closure.');
     session.activeOperation = true;
     try { return await operation(session); }
-    finally { session.activeOperation = false; }
+    finally { session.activeOperation = false; session.lastActivityAt = Date.now(); }
   }
 
   const send = (session, method, params = {}, options = {}) => session.browser.connection.send(method, params, session.cdpSessionId, options);
@@ -364,15 +367,32 @@ export function createBrowserController({chromePath, profileRoot, services = [],
     if(session.discoveryServiceId)serviceMap.delete(session.discoveryServiceId);
     session.handles.clear();
     session.redactor.clear();
+    closingSessions.set(session.id,session);
     session.closing=(async()=>{
-      try {await session.browser.close();}
-      finally {reservations.delete(session.id);}
+      try {
+        await session.browser.close();
+        reservations.delete(session.id);
+        closingSessions.delete(session.id);
+      } finally {session.closing=null;}
     })();
     return session.closing;
   }
 
+  async function closeAll(values) {
+    const results = await Promise.allSettled([...new Set(values)].map(closeOwnedSession));
+    const failures = results.filter(result => result.status === 'rejected').map(result => result.reason);
+    if (failures.length) throw new AggregateError(failures, 'Browser cleanup incomplete');
+  }
+  const reaper = setInterval(() => {
+    const cutoff = Date.now() - idleTimeoutMs;
+    const idle = [...sessions.values()].filter(session => !session.lease && !session.activeOperation && session.lastActivityAt <= cutoff);
+    closeAll(idle).catch(() => {});
+  }, Math.min(30000, Math.max(10, idleTimeoutMs)));
+  reaper.unref();
+
   function releaseTakeover(lease,quarantine) {
     if (!lease.active) return;
+    lease.session.lastActivityAt = Date.now();
     lease.active = false;
     clearTimeout(lease.timer);
     lease.abortController.abort();
@@ -387,6 +407,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
     const lease = takeovers.get(id);
     if (!lease?.active || lease.session.closed || lease.session.lease !== lease) fail('TAKEOVER_NOT_FOUND');
     if (lease.busy) fail('SESSION_BUSY');
+    lease.session.lastActivityAt = Date.now();
     lease.busy = true;
     try {
       await actualFrame(lease.session,lease.signal);
@@ -403,19 +424,19 @@ export function createBrowserController({chromePath, profileRoot, services = [],
       const normalized = normalizeService(service,testing);
       serviceMap.set(normalized.id,normalized);
       cancelReservations(reservation=>reservation.service.id===normalized.id,'SERVICE_CHANGED');
-      for (const session of [...sessions.values()]) if (session.service.id === normalized.id) await closeOwnedSession(session);
+      await closeAll([...sessions.values(),...closingSessions.values()].filter(session => session.service.id === normalized.id));
       return {id:normalized.id};
     },
     async removeService(id) {
       serviceMap.delete(id);
       cancelReservations(reservation=>reservation.service.id===id,'SERVICE_CHANGED');
-      for (const session of [...sessions.values()]) if (session.service.id === id) await closeOwnedSession(session);
+      await closeAll([...sessions.values(),...closingSessions.values()].filter(session => session.service.id === id));
     },
     async closeRequester(requesterId) {
       if (typeof requesterId !== 'string' || !requesterId.length) fail('INVALID_REQUESTER');
       requesterRevisions.set(requesterId,(requesterRevisions.get(requesterId) ?? 0)+1);
       cancelReservations(reservation=>reservation.ownerId===requesterId,'REQUESTER_REVOKED');
-      await Promise.all([...sessions.values()].filter(session=>session.ownerId===requesterId).map(closeOwnedSession));
+      await closeAll([...sessions.values(),...closingSessions.values()].filter(session=>session.ownerId===requesterId));
       return {status:'closed'};
     },
     async openDiscoverySession(url,requesterId,{method='password'}={}) {
@@ -481,7 +502,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
       const signal=reservation.abortController.signal;
       let browser,session,opened=false;
       try {
-        browser=await launchManagedChrome({chromePath,profileRoot,headless,extensionPaths,signal,
+        browser=await launchBrowser({chromePath,profileRoot,headless,extensionPaths,signal,
           prepareProfile:async({profilePath})=>{
             assertReservation(reservation);
             const prepared=await prepareProfile?.({profilePath,signal,service,session:{id,ownerId:requesterId,serviceId,origin:new URL(service.startUrl).origin,method:service.adaptive?.method}});
@@ -489,7 +510,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
             return prepared;
           }});
         assertReservation(reservation);
-        session={id,ownerId:requesterId,service,browser,revision:1,handles:new Map(),
+        session={id,ownerId:requesterId,service,browser,revision:1,handles:new Map(),lastActivityAt:Date.now(),
           worldName:`chromesync-${randomUUID()}`,stateKey:randomUUID(),redactor:createCredentialRedactor(),closed:false,
           lease:null,activeOperation:false,quarantined:false,blockedNavigation:false,planKey:randomUUID(),credentialsUsed:false,
           ...(service.adaptive?{adaptive:{expectedUsername:service.adaptive.expectedUsername},boundAccount:!service.id.startsWith('discovery-')}: {})};
@@ -524,8 +545,10 @@ export function createBrowserController({chromePath, profileRoot, services = [],
         throw error instanceof BrowserControllerError ? error : new BrowserControllerError('BROWSER_START_FAILED');
       } finally {
         if (!opened) {
-          try {if (session) await closeOwnedSession(session);else await browser?.close();}
-          finally {reservations.delete(id);}
+          if (browser) await closeOwnedSession(session || {
+            id, ownerId: requesterId, service, browser, handles: new Map(), redactor: { clear() {} },
+          });
+          else reservations.delete(id);
         }
       }
     },
@@ -636,6 +659,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
         if (error.name === 'AuthStoreError' || ['SESSION_CHANGED','AUTH_FLOW_UNAVAILABLE'].includes(error.code)) { error.credentialsSupplied = sinkInvoked; throw error; }
         return {credentialsSupplied:sinkInvoked,status:error.code === 'ABORTED' ? 'needs-user' : 'failed',reason:safeReason(error)};
       } finally {
+        session.lastActivityAt = Date.now();
         lease.active = false;
         clearTimeout(timer);
         signal?.removeEventListener('abort',onAbort);
@@ -775,8 +799,9 @@ export function createBrowserController({chromePath, profileRoot, services = [],
     },
     async close() {
       stopped = true;
+      clearInterval(reaper);
       cancelReservations(()=>true,'CONTROLLER_CLOSED');
-      await Promise.all([...sessions.values()].map(closeOwnedSession));
+      await closeAll([...sessions.values(),...closingSessions.values()]);
     },
   });
   return api;
