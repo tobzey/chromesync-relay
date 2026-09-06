@@ -113,6 +113,7 @@ export function startReceiver(chrome, port, config) {
   const receiverUrl = normalizeReceiverUrl(config.receiverUrl ?? `${config.origin}/`, config.origin);
   let binding;
   let active;
+  let draining = Promise.resolve();
   let target;
   let stopped = false;
   const send = message => port.postMessage({ v: 1, sessionId: config.sessionId, ...message });
@@ -138,9 +139,17 @@ export function startReceiver(chrome, port, config) {
     const entry = active;
     if (!entry) return;
     active = undefined;
+    entry.cancelWait();
     clearTimeout(entry.timer);
     if (notify) { try { send({ type: 'result', id: entry.request.id, error: { name: 'AbortError' } }); } catch {} }
-    if (entry.document) await chrome.scripting.executeScript({ target: { tabId: entry.document.tabId, documentIds: [entry.document.documentId] }, world: 'MAIN', func: cancelInPage, args: [entry.request.id] }).catch(() => {});
+    const stopping = entry.document ? chrome.scripting.executeScript({ target: { tabId: entry.document.tabId, documentIds: [entry.document.documentId] }, world: 'MAIN', func: cancelInPage, args: [entry.request.id] }).catch(() => {}) : Promise.resolve();
+    // Deliver cancellation immediately, but do not let another ceremony enter
+    // the page until the prior provider promise has actually settled. Providers
+    // may finish AbortSignal cleanup after cancelInPage itself has returned.
+    // A request canceled while waiting has no execution of its own. Preserve
+    // the existing barrier instead of retaining another pending promise chain.
+    if (entry.execution) draining = Promise.all([stopping, entry.execution.catch(() => {})]).then(() => {});
+    await stopping;
   };
   chrome.webNavigation.onCommitted.addListener(details => {
     if (details.frameId !== 0) return;
@@ -174,6 +183,7 @@ export function startReceiver(chrome, port, config) {
     if (message.type !== 'get') return;
     if (active) { send({ type: 'result', id: message.id, error: { name: 'InvalidStateError' } }); return; }
     const entry = { request: message };
+    entry.canceled = new Promise(resolve => { entry.cancelWait = resolve; });
     active = entry;
     try {
       entry.request = validateRequest(message, binding);
@@ -181,18 +191,25 @@ export function startReceiver(chrome, port, config) {
       entry.timer = setTimeout(async () => {
         if (active === entry) { await cancel(); send({ type: 'result', id: message.id, error: { name: 'NotAllowedError' } }); }
       }, Math.min(MAX_TIMEOUT_MS, entry.request.expiresAt - Date.now()));
+      // Register the request and its deadline before waiting: cancellation or
+      // timeout still ends this request even if the old provider ignores abort.
+      await Promise.race([draining, entry.canceled]);
+      if (active !== entry) return;
+      if (Date.now() >= entry.request.expiresAt) throw new Error('Expired request');
       entry.document = await ensureDocument();
       if (active !== entry) return;
-      const results = await chrome.scripting.executeScript({
+      entry.execution = chrome.scripting.executeScript({
         target: { tabId: entry.document.tabId, documentIds: [entry.document.documentId] },
         world: 'MAIN', func: requestInPage, args: [entry.request],
       });
+      const results = await entry.execution;
       if (active !== entry) return;
       const document = await singleDocument(chrome, config.origin, entry.document.tabId);
       if (document.documentId !== entry.document.documentId || Date.now() >= entry.request.expiresAt) throw new Error('Receiver document changed');
       if (results.length !== 1 || results[0].documentId !== entry.document.documentId) throw new Error('Ambiguous result');
       if (results[0].result?.error) throw Object.assign(new Error(), results[0].result.error);
       const assertion = await validateAssertion(results[0].result?.assertion, entry.request);
+      if (active !== entry) return;
       send({ type: 'result', id: message.id, assertion });
     } catch (error) {
       if (active === entry) send({ type: 'result', id: message.id, error: safeError(error) });

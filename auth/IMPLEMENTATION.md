@@ -32,6 +32,8 @@ Covered recovery includes changed sessions, wrong-account login, failed/expired 
 
 Final passkey compatibility checks verify that the receiver opens an owner-enrolled login path without following an origin-root redirect, unrelated provider popup closure/navigation preserves delivery of a genuine synthetic assertion, and destruction of the bound document/tab rejects authentication. A test-only provider promise delays the genuine assertion while the popup closes; no production provider hook or verification override is added. Enrollment rejects passkey flow origins that cannot match the original browser binding. Receiver URLs remain same-origin and bounded after URL serialization.
 
+A follow-up regression deliberately delays a provider's AbortSignal cleanup and immediately starts another approved ceremony. The receiver waits for the old provider execution to settle before entering the page again, while preserving the new request's cancellation and deadline. The test follows each exact dispatched request ID so it cannot mistake a canceled request for the next pending ceremony.
+
 ## Remaining inputs and live acceptance
 
 The remaining work needs the executor host, relay deployment/admission and a user-enrolled disposable 1Password vault/account. Provider secrets must be entered by the user through the trusted UI on that host. The exact setup and pass/fail sequence is in [the live acceptance runbook](../docs/authentication-acceptance.md). Do not call the whole requested deployment complete until these checks have been performed.

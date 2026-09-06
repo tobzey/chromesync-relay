@@ -120,22 +120,23 @@ test('actual MV3 sender, native host, hub and ordinary receiver complete synthet
   assert.equal(registration.exceptionDetails, undefined);
   const credential = registration.result.value;
   assert(credential?.id);
-  const receiverPending = () => until(async () => {
-    const value = await receiver.browser.connection.send('Runtime.evaluate', { expression: "globalThis[Symbol.for('io.chromesync.passkey.requests')]?.size === 1", returnByValue: true }, receiver.pageSession);
+  const receiverPending = requestId => until(async () => {
+    const value = await receiver.browser.connection.send('Runtime.evaluate', { expression: `globalThis[Symbol.for('io.chromesync.passkey.requests')]?.has(${JSON.stringify(requestId)}) === true`, returnByValue: true }, receiver.pageSession);
     return value.result.value === true;
-  }, 'real receiver WebAuthn waits for synthetic presence');
+  }, 'the exact dispatched WebAuthn request reaches the receiver');
   // Hold only delivery of the real, natively signed assertion. This models a
   // provider hook closing its UI before resolving its credential promise. CDP
   // presence=false deliberately never resolves an existing operation, so it
   // is used below for cancellation tests, not as a resumable approval gate.
   await receiver.browser.connection.send('Runtime.evaluate', { expression: `globalThis.fixtureNativeGet=navigator.credentials.get.bind(navigator.credentials);navigator.credentials.get=async options=>{const credential=await fixtureNativeGet(options);await new Promise(resolve=>{globalThis.fixtureReleaseAssertion=resolve});return credential;};` }, receiver.pageSession);
   const challenge = crypto.randomBytes(32).toString('base64url');
+  const initialDispatch = once(hub, 'dispatched');
   const authorization = hub.authenticate(sessionId, { timeoutMs: 20000, validateSession: async request => request.origin === origin }).then(value => ({ value }), error => ({ error: error.name }));
   const receiving = sender.browser.connection.send('Runtime.evaluate', {
     expression: `(async () => { const decode=v=>Uint8Array.from(atob(v.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0)); const key=await navigator.credentials.get({publicKey:{rpId:'localhost',challenge:decode(${JSON.stringify(challenge)}),allowCredentials:[{id:decode(${JSON.stringify(credential.id)}),type:'public-key'}],userVerification:'required',timeout:20000}}); return key.toJSON(); })()`,
     awaitPromise: true, returnByValue: true, userGesture: true,
   }, sender.pageSession, { timeoutMs: 25000 });
-  await receiverPending();
+  await receiverPending((await initialDispatch)[0].requestId);
   await until(async () => {
     const value = await receiver.browser.connection.send('Runtime.evaluate', { expression: "typeof fixtureReleaseAssertion === 'function'", returnByValue: true }, receiver.pageSession);
     return value.result.value === true;
@@ -177,32 +178,75 @@ test('actual MV3 sender, native host, hub and ordinary receiver complete synthet
   // Exercise Chrome's real cancellation event after dispatch, with the
   // synthetic authenticator waiting for presence rather than completing.
   await receiver.browser.connection.send('WebAuthn.setAutomaticPresenceSimulation', { authenticatorId, enabled: false }, receiver.pageSession);
+  // Model a provider that receives AbortSignal immediately but settles its
+  // credential promise later. A fresh approved request must wait for that
+  // cleanup, rather than colliding with the canceled page registry entry.
+  await receiver.browser.connection.send('Runtime.evaluate', { expression: `navigator.credentials.get=async options=>{try{return await fixtureNativeGet(options)}catch(error){if(error.name==='AbortError'){await new Promise(resolve=>{globalThis.fixtureReleaseCanceled=resolve})}throw error}};` }, receiver.pageSession);
   const canceledAuthorization = assert.rejects(hub.authenticate(sessionId, { timeoutMs: 20000, validateSession: async () => true }), { name: 'AbortError' });
   const dispatched = once(hub, 'dispatched');
   const waiting = sender.browser.connection.send('Runtime.evaluate', {
     expression: `(async () => { globalThis.testAbort = new AbortController(); try { await navigator.credentials.get({publicKey:{rpId:'localhost',challenge:crypto.getRandomValues(new Uint8Array(32)),userVerification:'required',timeout:20000},signal:testAbort.signal}); return 'unexpected'; } catch(error) { return error.name; } })()`,
     awaitPromise: true, returnByValue: true, userGesture: true,
   }, sender.pageSession, { timeoutMs: 25000 });
-  await dispatched;
+  const canceledRequestId = (await dispatched)[0].requestId;
+  await receiverPending(canceledRequestId);
   await sender.browser.connection.send('Runtime.evaluate', { expression: 'testAbort.abort()' }, sender.pageSession);
   assert.equal((await waiting).result.value, 'AbortError');
   await canceledAuthorization;
   assert.equal(hub.status(sessionId).pending, false);
 
-  const pendingCeremony = async (expectedErrors = ['AbortError']) => {
+  // The old provider remains held throughout both cases. Waiting for its
+  // cleanup must not prevent a queued request's own abort or deadline.
+  for (const expires of [false, true]) {
+    const queuedDispatch = once(hub, 'dispatched');
+    const queuedAuthorization = hub.authenticate(sessionId, { timeoutMs: 5000, validateSession: async () => true })
+      .then(value => ({ value }), error => ({ error: error.name }));
+    const queued = sender.browser.connection.send('Runtime.evaluate', {
+      expression: `(async()=>{globalThis.fixtureQueuedAbort=new AbortController();try{await navigator.credentials.get({signal:fixtureQueuedAbort.signal,publicKey:{rpId:'localhost',challenge:crypto.getRandomValues(new Uint8Array(32)),userVerification:'required',timeout:${expires ? 1000 : 20000}}});return 'unexpected'}catch(error){return error.name}})()`,
+      awaitPromise: true, returnByValue: true, userGesture: true,
+    }, sender.pageSession, { timeoutMs: 8000 });
+    await queuedDispatch;
+    await delay(100);
+    assert.equal(hub.status(sessionId).authenticating, true, 'A queued request waits for prior cleanup before entering the provider');
+    if (!expires) await sender.browser.connection.send('Runtime.evaluate', { expression: 'fixtureQueuedAbort.abort()' }, sender.pageSession);
+    assert.equal((await queued).result.value, expires ? 'NotAllowedError' : 'AbortError');
+    const outcome = await queuedAuthorization;
+    assert(expires ? ['Error', 'NotAllowedError'].includes(outcome.error) : outcome.error === 'AbortError');
+    assert.equal(outcome.value, undefined);
+    assert.equal(hub.status(sessionId).pending, false);
+    const entries = await receiver.browser.connection.send('Runtime.evaluate', { expression: "Array.from(globalThis[Symbol.for('io.chromesync.passkey.requests')].keys())", returnByValue: true }, receiver.pageSession);
+    assert.deepEqual(entries.result.value, [canceledRequestId], 'Only the original canceled provider remains; queued requests never entered its page');
+  }
+
+  const pendingCeremony = async (expectedErrors = ['AbortError'], beforeReceiver) => {
+    const dispatched = once(hub, 'dispatched');
     const authorized = assert.rejects(hub.authenticate(sessionId, { timeoutMs: 20000, validateSession: async () => true }), error => expectedErrors.includes(error.name));
+    authorized.catch(() => {}); // The caller awaits and checks this after its lifecycle action.
     const result = sender.browser.connection.send('Runtime.evaluate', {
       expression: `(async () => { try { await navigator.credentials.get({publicKey:{rpId:'localhost',challenge:crypto.getRandomValues(new Uint8Array(32)),userVerification:'required',timeout:20000}}); return 'unexpected'; } catch(error) { return error.name; } })()`,
       awaitPromise: true, returnByValue: true, userGesture: true,
     }, sender.pageSession, { timeoutMs: 25000 }).then(value => ({ value }), error => ({ error }));
-    await receiverPending();
+    const requestId = (await dispatched)[0].requestId;
+    await beforeReceiver?.(requestId);
+    await receiverPending(requestId);
     return { authorized, result };
   };
   // Chrome can tear down the script context before onCommitted/onRemoved runs.
   // Both native cancellation errors must fail the hub and original request;
   // neither a destroyed document nor a closed tab may deliver an assertion.
   const receiverDestructionErrors = ['AbortError', 'NotAllowedError'];
-  const receiverNavigation = await pendingCeremony(receiverDestructionErrors);
+  const receiverNavigation = await pendingCeremony(receiverDestructionErrors, async requestId => {
+    await until(async () => {
+      const value = await receiver.browser.connection.send('Runtime.evaluate', { expression: "typeof fixtureReleaseCanceled === 'function'", returnByValue: true }, receiver.pageSession);
+      return value.result.value === true;
+    }, 'canceled provider call is deliberately waiting to settle');
+    const entries = await receiver.browser.connection.send('Runtime.evaluate', { expression: "Array.from(globalThis[Symbol.for('io.chromesync.passkey.requests')].keys())", returnByValue: true }, receiver.pageSession);
+    assert.deepEqual(entries.result.value, [canceledRequestId]);
+    assert.notEqual(requestId, canceledRequestId);
+    await delay(100);
+    assert.equal(hub.status(sessionId).authenticating, true, 'The new approved ceremony must wait for prior provider cancellation to drain');
+    await receiver.browser.connection.send('Runtime.evaluate', { expression: 'navigator.credentials.get=fixtureNativeGet;fixtureReleaseCanceled();' }, receiver.pageSession);
+  });
   await receiver.browser.connection.send('Page.navigate', { url: `${origin}/receiver-replaced` }, receiver.pageSession);
   await receiverNavigation.authorized;
   assert(receiverDestructionErrors.includes((await receiverNavigation.result).value?.result.value), 'Replacing the bound receiver document must cancel the original request');
