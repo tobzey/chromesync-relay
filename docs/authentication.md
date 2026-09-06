@@ -30,7 +30,7 @@ flowchart LR
     E -->|Verified cookies through encrypted channel| B[Agent-owned session browser]
 ```
 
-Install Node 22+, Chrome and the OS credential-store requirements from [installation](install.md). Install the pinned executor dependency from the repository root:
+Install Node 22+ with npm, Chrome and the OS credential-store requirements from [installation](install.md). Verified installs and updates provision and import-check the pinned SDK before activation. For a source checkout, install it from that repository root:
 
 ```sh
 npm ci --prefix auth --ignore-scripts
@@ -84,10 +84,14 @@ Interactive authentication requires relay budgets above the existing cookie-snap
 ## Connect a vault once
 
 1. Create a custom 1Password vault containing only accounts available to this integration. Give a service account read-only access to that vault. Service accounts cannot access the built-in Personal, Private, Employee or default Shared vaults; the vault restriction is enforced by 1Password. See [service account setup](https://www.1password.dev/service-accounts/get-started).
-2. Open **Vault & devices** in the trusted inbox and connect the service account. Enter the token only in that owner UI. It travels encrypted to the executor and is saved in its OS credential store. Never paste it into an agent conversation or command argument.
+2. Open **Vault & devices** in the trusted inbox and connect the service account. Enter the token only in that owner UI. The executor validates SDK authentication and builds the accessible vault metadata catalog before saving it in its OS credential store. A rejected candidate does not replace an existing connection. Never paste the token into an agent conversation or command argument.
 3. Enable account discovery for the connection. Agents can now search accounts by exact website origin and optional item name. There is no per-account JSON setup for a standard login. Use distinct item titles when you have several accounts at the same site; usernames are not exposed by search.
 
-Search reads item overviews and returns only bounded titles, website origins, exact-origin/name match reasons and temporary opaque handles. It does not return usernames, passwords, TOTP seeds or codes. The executor builds this metadata index on demand, caches it for five minutes, and returns at most 20 results per page. A synthetic 3,000-item catalog is tested; the index has a 20,000-item cap. This uses the SDK's [vault and item listing API](https://www.1password.dev/sdks/list-vaults-items). Account titles are deliberately disclosed metadata, so do not put secrets in them.
+The inbox remembers its selected tab in the URL fragment and reloads saved connections independently of requests, accounts and devices. An empty token field after refresh is expected. Each saved card reports whether the executor has a credential, without returning that credential. A failed status poll preserves the last confirmed cards; an initial failure says status is unknown rather than showing an empty vault. After an executor restart, a saved connection is shown as unchecked until discovery or **Check connection** verifies it.
+
+Use **Check connection** to revalidate the stored token and rebuild the catalog immediately, including after a failed refresh. The owner sees fixed diagnostic codes for a missing SDK, invalid/rejected authentication, vault or item access, network failures and capacity. Agents still receive a generic `catalog-provider-unavailable` result. A successful reconnect clears the previous catalog failure backoff. Upgrade and restart both the executor and approver when adopting this provider-status API; old executor versions do not supply the new credential-presence projection.
+
+Search reads item overviews and returns only bounded titles, website origins, exact-origin/name match reasons and temporary opaque handles. It does not return usernames, passwords, TOTP seeds or codes. The executor builds this metadata index during connection validation or on demand, caches it for five minutes, and returns at most 20 results per page. A synthetic 3,000-item catalog is tested; the index has a 20,000-item cap. This uses the SDK's [vault and item listing API](https://www.1password.dev/sdks/list-vaults-items). Account titles are deliberately disclosed metadata, so do not put secrets in them.
 
 Selecting a password account privately calls the SDK's `items.get` to infer the username, password and optional TOTP field references. **That selected-item read includes its values inside the trusted SDK/executor before fill approval.** Values are neither returned to the agent nor retained in the catalog. Approval gates credential use in the browser, rather than this private schema read. See the SDK's [item retrieval API](https://www.1password.dev/sdks/manage-items). Factors are reported after this selected-account schema inspection. Ambiguous or unsupported item fields require owner review.
 

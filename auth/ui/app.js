@@ -1,4 +1,8 @@
-let csrf, currentView = 'requests', refreshing = false;
+const views = new Set(['requests', 'policies', 'services']);
+const viewFromHash = () => views.has(location.hash.slice(1)) ? location.hash.slice(1) : 'requests';
+let csrf, currentView = viewFromHash();
+const refreshing = new Set(), componentStatus = new Map(), providerActions = new Set();
+let savedProviders, providerRevision = 0, providerRenderKey;
 const preferences = new Map();
 const pages = Object.fromEntries(['requests', 'policies', 'services'].map(name => [name, { cursor: null, history: [] }]));
 let requestRenderKey;
@@ -6,12 +10,24 @@ let activeTakeover, captureBusy = false;
 const $ = selector => document.querySelector(selector);
 function element(tag, text, className) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; }
 function notice(text) { $('#notice').textContent = text; $('#notice').hidden = false; }
-async function call(operation, args = {}) {
-  const response = await fetch('/api', { method: 'POST', headers: { 'content-type': 'application/json', 'x-csrf-token': csrf }, body: JSON.stringify({ operation, args }) });
-  const body = await response.json();
-  if (!response.ok || body.result?.status === 'uncertain') throw new Error(body.error || 'The executor has not confirmed the result. Refresh before trying again.');
-  if (body.result?.status === 'failed') throw new Error(`The executor could not complete this request (${body.result.reason || 'failed'}).`);
-  return body.result;
+async function call(operation, args = {}, { timeoutMs, allowFailed = false } = {}) {
+  const controller = timeoutMs ? new AbortController() : undefined;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+  try {
+    const response = await fetch('/api', { method: 'POST', headers: { 'content-type': 'application/json', 'x-csrf-token': csrf }, body: JSON.stringify({ operation, args }), signal: controller?.signal });
+    const body = await response.json();
+    if (!response.ok || body.result?.status === 'uncertain') throw new Error(body.error || 'The executor has not confirmed the result. Check its status before trying again.');
+    if (body.result?.status === 'failed' && !allowFailed) throw new Error(`The executor could not complete this request (${body.result.reason || 'failed'}).`);
+    return body.result;
+  } catch (error) {
+    if (controller?.signal.aborted) throw new Error('The executor did not respond in time. Its connection state is unknown.');
+    throw error;
+  } finally { clearTimeout(timer); }
+}
+function connectionStatus(component, status) {
+  componentStatus.set(component, status);
+  const states = [...componentStatus.values()];
+  $('#connection').textContent = states.includes('error') ? states.includes('ready') ? 'Some status is unavailable' : 'Waiting for executor' : states.includes('ready') ? 'Executor connected' : 'Connecting…';
 }
 function action(label, handler, className) {
   const button = element('button', label, className);
@@ -84,47 +100,145 @@ function renderPolicies(policies) {
     card.append(element('h3', policy.serviceId), element('div', policy.origin, 'origin'), element('p', `${policy.accountId} · ${(policy.factors || []).join(', ')} · ${(policy.purposes || []).join(', ')}`, 'meta'), element('p', policy.expiresAt == null ? 'Until revoked' : `Expires ${new Date(policy.expiresAt).toLocaleString()}`, 'meta'), action('Revoke', () => call('policy.revoke', { policyId: policy.id || policy.policyId }), 'deny')); list.append(card);
   }
 }
-function renderServices(services, peers, providers) {
+function renderServices(services) {
   const list = $('#service-list'); list.replaceChildren();
   if (!services.length) empty(list, 'Accounts appear when an agent selects one.', 'Connect your vault above. Each new request comes here for approval; service configuration is optional.');
   for (const service of services) { const card = element('article', undefined, 'card'); card.append(element('h3', service.name || service.serviceId), element('p', `${service.accountId} · ${(service.factors || []).join(', ')}`, 'meta')); list.append(card); }
-  const connections = $('#provider-list'); connections.replaceChildren();
-  for (const provider of providers) {
-    const card = element('article', undefined, 'card');
-    card.append(element('h3', provider.id), element('p', provider.discoveryEnabled ? 'Agents can find accounts in this connected vault.' : 'Account discovery is disabled for this connection.'),
-      action(provider.discoveryEnabled ? 'Disable account discovery' : 'Enable account discovery', () => call('provider.discovery', { providerId: provider.id, enabled: !provider.discoveryEnabled })));
-    connections.append(card);
-  }
+}
+function renderPeers(peers) {
   const devices = $('#peer-list'); devices.replaceChildren();
   for (const peer of peers) { const card = element('article', undefined, 'card'); card.append(element('h3', peer.role), element('p', peer.id, 'meta')); if (peer.enabled) card.append(action('Revoke device', () => call('peer.revoke', { peerId: peer.id }), 'deny')); else card.append(element('span', 'Revoked', 'pill')); devices.append(card); }
 }
-async function refresh() {
-  if (activeTakeover) return;
-  if (refreshing) return;
-  refreshing = true;
-  try {
-    if (currentView === 'requests') {
-      const page = await call('requests', { cursor: pages.requests.cursor });
-      renderRequests(page.items, page.hasMore); renderPages('requests', page, '#request-pages');
-    } else if (currentView === 'policies') {
-      const page = await call('policies', { cursor: pages.policies.cursor });
-      renderPolicies(page.items); renderPages('policies', page, '#policy-pages');
-    } else {
-      const page = await call('enrollments', { cursor: pages.services.cursor });
-      const [peers, providers] = await Promise.all([call('peers'), call('providers')]);
-      renderServices(page.items, peers, providers); renderPages('services', page, '#service-pages');
+function providerSummary(value) {
+  if (!value || typeof value.id !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(value.id) ||
+      typeof value.hasCredential !== 'boolean' || typeof value.discoveryEnabled !== 'boolean') throw new Error('Connection status is unavailable.');
+  // Retain only the owner-facing projection, never a credential-bearing reply.
+  const health = {};
+  for (const field of ['status', 'stage', 'code', 'message']) if (typeof value.health?.[field] === 'string') health[field] = value.health[field].slice(0, field === 'message' ? 400 : 80);
+  for (const field of ['checkedAt', 'retryAt', 'vaultCount', 'itemCount', 'loginItemCount']) if (Number.isSafeInteger(value.health?.[field]) && value.health[field] >= 0) health[field] = value.health[field];
+  return { id: value.id, hasCredential: value.hasCredential, discoveryEnabled: value.discoveryEnabled, health };
+}
+function providerStatus(message, state) { $('#provider-status').textContent = message; $('#provider-status').dataset.state = state; }
+function renderProviders() {
+  if (savedProviders === undefined) return;
+  const key = JSON.stringify([savedProviders, [...providerActions]]);
+  if (key === providerRenderKey) return;
+  providerRenderKey = key;
+  const list = $('#provider-list'); list.replaceChildren();
+  if (!savedProviders.length) { empty(list, 'No saved connections.', 'Connect your restricted 1Password service account above.'); return; }
+  for (const provider of savedProviders) {
+    const card = element('article', undefined, 'card'); card.dataset.providerId = provider.id;
+    card.append(element('h3', provider.id), element('p', provider.hasCredential ? 'Credential stored on the executor.' : 'No credential is stored for this connection.'),
+      element('strong', provider.health.status === 'ready' ? 'Connection verified' : provider.health.status === 'error' ? 'Connection needs attention' : provider.health.status === 'checking' ? 'Checking connection' : 'Connection not yet checked'),
+      element('p', provider.health.message || (provider.health.status === 'ready' ? 'Authentication and vault metadata access were verified.' : provider.health.status === 'checking' ? 'The executor is checking authentication and vault metadata access.' : 'Connection health has not been checked.')),
+      element('p', provider.discoveryEnabled ? 'Account discovery is enabled.' : 'Account discovery is disabled.'));
+    const details = [];
+    if (provider.health.code) details.push(`Status: ${provider.health.code}`);
+    if (provider.health.checkedAt) details.push(`Checked ${new Date(provider.health.checkedAt).toLocaleString()}`);
+    if (provider.health.retryAt > Date.now()) details.push(`Retry after ${new Date(provider.health.retryAt).toLocaleTimeString()}`);
+    if (provider.health.vaultCount !== undefined) details.push(`${provider.health.vaultCount} vaults`);
+    if (provider.health.itemCount !== undefined) details.push(`${provider.health.itemCount} items`);
+    if (provider.health.loginItemCount !== undefined) details.push(`${provider.health.loginItemCount} login items`);
+    if (details.length) card.append(element('p', details.join(' · '), 'meta'));
+    const actions = element('div', undefined, 'actions');
+    for (const [label, operation, args] of [
+      ['Check connection', 'provider.check', { providerId: provider.id }],
+      [provider.discoveryEnabled ? 'Disable account discovery' : 'Enable account discovery', 'provider.discovery', { providerId: provider.id, enabled: !provider.discoveryEnabled }],
+    ]) {
+      const button = element('button', label); button.disabled = !provider.hasCredential || providerActions.has(provider.id);
+      button.addEventListener('click', () => changeProvider(provider.id, operation, args)); actions.append(button);
     }
-    $('#connection').textContent = 'Executor connected';
-  } catch (error) { $('#connection').textContent = 'Waiting for executor'; notice(error.message); }
-  finally { refreshing = false; }
+    card.append(actions); list.append(card);
+  }
+}
+function applyProvider(value) {
+  const summary = providerSummary(value);
+  savedProviders = [...(savedProviders || []).filter(provider => provider.id !== summary.id), summary].sort((a, b) => a.id.localeCompare(b.id));
+  providerRevision++; renderProviders(); connectionStatus('providers', 'ready');
+  providerStatus('Showing confirmed connection status.', 'ready');
+}
+async function refreshProviders() {
+  if (!csrf || refreshing.has('providers') || providerActions.size) return;
+  refreshing.add('providers');
+  const revision = providerRevision;
+  providerStatus(savedProviders === undefined ? 'Loading saved connections…' : 'Refreshing connection status…', 'loading');
+  try {
+    const result = await call('providers', {}, { timeoutMs: 15000 });
+    if (revision !== providerRevision) return;
+    if (!Array.isArray(result)) throw new Error('Connection status is unavailable.');
+    const providers = result.map(providerSummary);
+    if (new Set(providers.map(provider => provider.id)).size !== providers.length) throw new Error('Connection status is unavailable.');
+    savedProviders = providers; renderProviders(); connectionStatus('providers', 'ready');
+    providerStatus(providers.length ? 'Showing confirmed connection status.' : 'The executor has no saved connections.', providers.length ? 'ready' : 'empty');
+  } catch {
+    if (revision !== providerRevision) return;
+    connectionStatus('providers', 'error');
+    providerStatus(savedProviders === undefined ? 'Connection status is unknown. Could not load saved connections; retrying automatically.' : 'Could not refresh connections. Showing the last confirmed status; retrying automatically.', 'error');
+  } finally { refreshing.delete('providers'); }
+}
+async function changeProvider(id, operation, args) {
+  if (providerActions.has(id)) return;
+  providerActions.add(id); providerRevision++; renderProviders();
+  providerStatus(operation === 'provider.check' ? 'Checking the saved credential and account catalog…' : 'Updating account discovery…', 'loading');
+  try {
+    const result = await call(operation, args, { timeoutMs: 95000, allowFailed: true });
+    if (result?.status === 'failed') {
+      if (result.provider) applyProvider(result.provider);
+      providerStatus(result.message || 'The saved connection could not be verified. Check the executor and try again.', 'error');
+      return;
+    }
+    if (result?.provider || result?.id) applyProvider(result.provider || result);
+    else if (operation === 'provider.discovery' && result?.status === 'configured') {
+      const previous = savedProviders?.find(provider => provider.id === id);
+      if (previous) applyProvider({ ...previous, discoveryEnabled: args.enabled });
+    } else throw new Error('The executor has not confirmed the connection status.');
+  } catch (error) {
+    providerStatus(`${error.message} The last confirmed connection remains displayed.`, 'error');
+  } finally { providerActions.delete(id); renderProviders(); }
+}
+async function refreshComponent(name, operation, args, render, statusSelector) {
+  if (refreshing.has(name)) return;
+  refreshing.add(name);
+  try {
+    render(await call(operation, args)); connectionStatus(name, 'ready');
+    if (statusSelector) $(statusSelector).hidden = true;
+  } catch (error) {
+    connectionStatus(name, 'error');
+    if (statusSelector) { $(statusSelector).textContent = 'This information could not be refreshed. Saved connections are checked separately.'; $(statusSelector).hidden = false; }
+    else notice(error.message);
+  } finally { refreshing.delete(name); }
+}
+function refresh() {
+  if (!csrf) return Promise.resolve();
+  const work = [refreshProviders()];
+  if (!activeTakeover) {
+    if (currentView === 'requests') work.push(refreshComponent('requests', 'requests', { cursor: pages.requests.cursor }, page => {
+      renderRequests(page.items, page.hasMore); renderPages('requests', page, '#request-pages');
+    }));
+    else if (currentView === 'policies') work.push(refreshComponent('policies', 'policies', { cursor: pages.policies.cursor }, page => {
+      renderPolicies(page.items); renderPages('policies', page, '#policy-pages');
+    }));
+    else work.push(refreshComponent('services', 'enrollments', { cursor: pages.services.cursor }, page => {
+      renderServices(page.items); renderPages('services', page, '#service-pages');
+    }, '#service-status'), refreshComponent('peers', 'peers', {}, renderPeers, '#peer-status'));
+  }
+  return Promise.allSettled(work);
+}
+function selectView(view) {
+  currentView = views.has(view) ? view : 'requests';
+  // Only a fixed tab name survives reload. No account or credential metadata
+  // is persisted in browser storage, including across changing inbox ports.
+  history.replaceState(null, '', `#${currentView}`);
+  document.querySelectorAll('.view').forEach(view => view.hidden = view.id !== currentView);
+  document.querySelectorAll('[data-view]').forEach(tab => tab.dataset.view === currentView ? tab.setAttribute('aria-current', 'page') : tab.removeAttribute('aria-current'));
 }
 document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => {
   if (activeTakeover) { notice('Finish or stop the protected browser session first.'); return; }
-  currentView = button.dataset.view;
-  document.querySelectorAll('.view').forEach(view => view.hidden = view.id !== currentView);
-  document.querySelectorAll('[data-view]').forEach(tab => tab === button ? tab.setAttribute('aria-current', 'page') : tab.removeAttribute('aria-current'));
+  selectView(button.dataset.view);
   refresh();
 }));
+window.addEventListener('hashchange', () => { if (!activeTakeover) { selectView(viewFromHash()); refresh(); } });
+selectView(currentView);
 async function capture() {
   if (!activeTakeover || captureBusy) return;
   captureBusy = true;
@@ -209,7 +323,7 @@ $('#takeover-refresh').addEventListener('click', capture);
 function leaveInteraction() {
   activeTakeover = undefined; $('#takeover-image').removeAttribute('src'); $('#takeover-text').value = ''; $('#takeover').hidden = true;
   $('#takeover-confirm').checked = false; $('#takeover-confirm-label').hidden = true;
-  currentView = 'requests'; $('#requests').hidden = false; requestRenderKey = undefined;
+  selectView('requests'); requestRenderKey = undefined;
 }
 async function finishTakeover(cancel) {
   if (!activeTakeover || captureBusy) return;
@@ -238,10 +352,23 @@ $('#takeover-done').addEventListener('click', () => finishTakeover(false));
 $('#takeover-cancel').addEventListener('click', () => finishTakeover(true));
 $('#provider-form').addEventListener('submit', async event => {
   event.preventDefault(); const form = event.target; const token = form.elements.token;
-  const credential = token.value; token.value = '';
+  let credential = token.value; token.value = '';
+  const providerId = form.elements.providerId.value;
+  if (providerActions.has(providerId)) return;
+  providerActions.add(providerId); providerRevision++; renderProviders();
   const button = form.querySelector('button[type="submit"]'); button.disabled = true;
-  try { await call('provider.put', { providerId: form.elements.providerId.value, token: credential, discoveryEnabled: form.elements.discoveryEnabled.checked }); notice('1Password connection saved on the executor.'); await refresh(); }
-  catch (error) { notice(error.message); } finally { token.value = ''; button.disabled = false; }
+  providerStatus('Validating the connection and building its account catalog…', 'loading');
+  try {
+    const result = await call('provider.put', { providerId, token: credential, discoveryEnabled: form.elements.discoveryEnabled.checked }, { timeoutMs: 95000, allowFailed: true });
+    if (result?.provider) applyProvider(result.provider);
+    if (result?.status === 'failed') {
+      const message = result.message || 'The connection could not be verified. No new connection was confirmed.';
+      providerStatus(message, 'error'); notice(message); return;
+    }
+    if (result?.status !== 'configured' || !result.provider) throw new Error('The connection result is unknown. Check its status before trying again.');
+    notice('1Password connection verified and saved on the executor.');
+  } catch (error) { providerStatus(error.message, 'error'); notice(error.message); }
+  finally { credential = undefined; token.value = ''; button.disabled = false; providerActions.delete(providerId); renderProviders(); }
 });
 $('#enrollment-form').addEventListener('submit', async event => {
   event.preventDefault();
@@ -264,4 +391,8 @@ $('#example').addEventListener('click', () => {
   };
   $('#enrollment-form').elements.enrollment.value = JSON.stringify(example, null, 2);
 });
-(async () => { const response = await fetch('/api/bootstrap'); ({ csrf } = await response.json()); await refresh(); setInterval(() => activeTakeover?.mode === 'receiver' ? capture() : refresh(), 3000); })().catch(() => notice('Reload this trusted approval window to reconnect.'));
+(async () => {
+  const response = await fetch('/api/bootstrap'); ({ csrf } = await response.json());
+  setInterval(() => { refresh(); if (activeTakeover?.mode === 'receiver') capture(); }, 3000);
+  await refresh();
+})().catch(() => { providerStatus('Connection status is unknown. Reload this trusted approval window to reconnect.', 'error'); notice('Reload this trusted approval window to reconnect.'); });

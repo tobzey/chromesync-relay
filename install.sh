@@ -35,7 +35,21 @@ main() {
   mkdir -p "$install_root/releases" "$install_root/runtimes" "$bin_dir"
   mkdir "$install_root/.install-lock" 2>/dev/null || fail 'Another installation is running, or .install-lock is stale. Check before removing it.'
   install_tmp=$(mktemp -d "$install_root/.download.XXXXXX")
-  trap 'rm -rf "$install_tmp"; rmdir "$install_root/.install-lock" 2>/dev/null || true' EXIT
+  dependency_restore_path=
+  cleanup_install() {
+    if [ -n "$dependency_restore_path" ] && [ ! -e "$dependency_restore_path" ] && [ ! -L "$dependency_restore_path" ]; then
+      if [ -e "$install_tmp/previous-node_modules" ] || [ -L "$install_tmp/previous-node_modules" ]; then
+        if ! mv "$install_tmp/previous-node_modules" "$dependency_restore_path"; then
+          printf 'ChromeSync: dependency backup preserved at %s/previous-node_modules\n' "$install_tmp" >&2
+          rmdir "$install_root/.install-lock" 2>/dev/null || true
+          return
+        fi
+      fi
+    fi
+    rm -rf "$install_tmp"
+    rmdir "$install_root/.install-lock" 2>/dev/null || true
+  }
+  trap cleanup_install EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   printf '\nChromeSync — your sessions, across your browsers.\n\n'
@@ -59,13 +73,37 @@ main() {
   git -C "$install_tmp/source" cat-file commit "$commit" | sed '/^$/q' | grep -q '^gpgsig -----BEGIN SSH SIGNATURE-----$' || fail 'An SSH-signed source commit is required.'
   git -C "$install_tmp/source" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$signers" verify-commit "$commit" || fail 'Commit signature verification failed; nothing was activated.'
   release_dir="$install_root/releases/$commit"
-  if [ ! -d "$release_dir" ]; then
-    git -C "$install_tmp/source" archive --format=tar "$commit" > "$install_tmp/app.tar"
-    mkdir "$install_tmp/app"
-    tar -xf "$install_tmp/app.tar" -C "$install_tmp/app"
-    [ -f "$install_tmp/app/cli/install.js" ] || fail 'This revision has no installer.'
+  git -C "$install_tmp/source" archive --format=tar "$commit" > "$install_tmp/app.tar"
+  mkdir "$install_tmp/app"
+  tar -xf "$install_tmp/app.tar" -C "$install_tmp/app"
+  [ -f "$install_tmp/app/cli/install.js" ] || fail 'This revision has no installer.'
+  [ -f "$install_tmp/app/scripts/verify-auth-sdk.mjs" ] || fail 'This revision has no authentication dependency check.'
+  if [ ! -d "$release_dir" ] || ! "$node_bin" "$install_tmp/app/scripts/verify-auth-sdk.mjs" "$install_tmp/app" "$release_dir" >/dev/null 2>&1; then
+    command -v npm >/dev/null 2>&1 || fail 'Install npm with Node.js to provision the pinned authentication SDK.'
+    printf 'Installing the pinned authentication SDK from the verified lockfile…\n'
+    # Stage dependencies before touching any active release. npm ci verifies
+    # lockfile integrity; lifecycle scripts and optional audit calls are disabled.
+    npm ci --prefix "$install_tmp/app/auth" --ignore-scripts --omit=dev --no-audit --no-fund || fail 'Authentication dependency installation failed; the current installation was preserved.'
+    "$node_bin" "$install_tmp/app/scripts/verify-auth-sdk.mjs" "$install_tmp/app" || fail 'Authentication SDK startup check failed; the current installation was preserved.'
     "$node_bin" "$install_tmp/app/cli/index.js" --help >/dev/null || fail 'Verified CLI failed its startup check.'
-    mv "$install_tmp/app" "$release_dir"
+    if [ ! -d "$release_dir" ]; then
+      mv "$install_tmp/app" "$release_dir"
+    else
+      # Repair a previously installed copy without running npm ci in its live
+      # node_modules. Keep the old tree until the staged replacement is in place.
+      [ -d "$release_dir/auth" ] && [ ! -L "$release_dir/auth" ] || fail 'Invalid installed authentication directory.'
+      dependency_restore_path="$release_dir/auth/node_modules"
+      if [ -e "$release_dir/auth/node_modules" ] || [ -L "$release_dir/auth/node_modules" ]; then
+        mv "$release_dir/auth/node_modules" "$install_tmp/previous-node_modules"
+      fi
+      if ! mv "$install_tmp/app/auth/node_modules" "$release_dir/auth/node_modules"; then
+        if [ -e "$install_tmp/previous-node_modules" ] || [ -L "$install_tmp/previous-node_modules" ]; then
+          mv "$install_tmp/previous-node_modules" "$release_dir/auth/node_modules"
+        fi
+        fail 'Authentication dependency repair failed; the previous dependency tree was restored.'
+      fi
+      dependency_restore_path=
+    fi
   fi
   "$node_bin" "$release_dir/cli/install.js" activate "$install_root" "$bin_dir" "$commit"
   [ -x "$bin_dir/chromesync" ] || fail 'The command was not installed successfully.'

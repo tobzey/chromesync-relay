@@ -18,7 +18,17 @@ Implementation and synthetic integration verification are complete. Live deploym
 - [x] End-to-end approval and always-allow behavior through a real local relay, with secret-free agent results.
 - [ ] Install and verify the background service, relay admission and reboot behavior on the chosen separate executor and approval hosts. No real hosts or provider accounts were provisioned by these tests.
 
-## Verification recorded on 2026-09-06
+## Vault connection recovery verification on 2026-09-06
+
+The refresh/discovery regression is fixed: saved provider cards load independently on every inbox bootstrap, the selected tab survives F5, failed polls retain last confirmed cards, and initial failures report unknown state. The owner receives only credential presence and fixed connection-health metadata. `provider.put` authenticates and builds a bounded metadata catalog before saving; invalid or timed-out candidates cannot replace an existing connection. `provider.check` retries stored credentials without the catalog failure backoff. Verified installation stages the locked SDK and verifies its WASM import before activating the release.
+
+- Strict authentication suite with disposable Chrome for Testing 152.0.7977.82: **171 passed, zero failures, zero skips** (107.53 seconds).
+- Final runtime/provider/discovery subset, including requester revocation during credential-store completion: **30 passed**.
+- Installer, release packaging and CLI subset: **17 passed**; remaining non-authentication regressions: **132 passed, one platform skip**, zero failures.
+- Synthetic end-to-end inbox/encrypted-relay/provider/search verification uses `https://socialhood-munich.com/admin` and confirms a full 32,000-character credential reaches the private SDK unchanged. Tests do not visit the real service or read its vault. Candidate failure, missing SDK, catalog access failure, immediate recovery, timeout admission and persistence-readback failure are covered.
+- The real installed SDK 0.5.0 rejects a deliberately invalid synthetic token as the safe `auth-invalid` diagnostic. Its raw error is never returned. No live credential or provider account was inspected; deployment still requires the owner's known-origin retest in [the setup guide](../docs/authentication.md#connect-a-vault-once).
+
+## Earlier verification recorded on 2026-09-06
 
 - Node.js 22.23.2, macOS ARM64, checksum-verified Chrome for Testing 152.0.7977.82.
 - `node scripts/test-auth-e2e.mjs` with that browser: **115 passed, zero failures, zero skipped**, 69.88 seconds. The strict entrypoint enables all real browser suites. This run includes uncertain-result retention and the final passkey compatibility regressions.

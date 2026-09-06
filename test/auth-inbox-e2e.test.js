@@ -28,7 +28,7 @@ test('approval inbox preserves factor choices, paginates, and privately drives a
         ? {items:passkey.status==='succeeded'?[]:[structuredClone(passkey)],nextCursor:null,hasMore:false}
         : {items:[structuredClone(password)],nextCursor:'synthetic-page-2',hasMore:true};
       if(['policies','enrollments'].includes(operation)) return {items:[],nextCursor:null,hasMore:false};
-      if(operation==='peers') return [];
+      if(['peers','providers'].includes(operation)) return [];
       if(operation==='request.decide') {
         if(args.requestId===password.requestId){password.status='needs-user';return{requestId:password.requestId,status:'needs-user',reason:'additional-approval-required'};}
         assert.equal(args.requestId,passkey.requestId);

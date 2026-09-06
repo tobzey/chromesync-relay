@@ -84,7 +84,8 @@ async function fixture(t, { additionalProviders = {}, passkeyProvider } = {}) {
     loadToken: async (id) => { calls.token++; return loadAuthSecrets(home).providers[id]?.token; },
     loadSdk: async () => ({ createClient: async (configuration) => {
       assert.equal(configuration.auth, TOKEN);
-      return { secrets: { resolve: async (reference) => {
+      return { vaults: { list: async () => [{ id: 'syntheticvault', contentVersion: 1 }] },
+        items: { list: async () => [] }, secrets: { resolve: async (reference) => {
         calls.references.push(reference);
         if (reference.endsWith('/password')) return PASSWORD;
         if (reference.endsWith('/otp?attribute=otp')) return '123456';
@@ -94,7 +95,7 @@ async function fixture(t, { additionalProviders = {}, passkeyProvider } = {}) {
   });
   runtime = await createAuthExecutor({ home, controller, providers: { onepassword: provider, ...additionalProviders }, passkeyProvider });
   const dispatch = (operation, args = {}, role = 'agent') => runtime.dispatch(operation, args, principals[role]);
-  await dispatch('provider.put', { token: TOKEN }, 'executor');
+  assert.equal((await dispatch('provider.put', { token: TOKEN }, 'executor')).status, 'configured');
   await dispatch('enrollment.put', { enrollment }, 'approver');
   return { directory, home, runtime, controller, provider, principals, sessions, services, calls, dispatch, cleanup };
 }
@@ -104,7 +105,7 @@ test('runtime limits agent operations and public service list excludes provider 
   const publicServices = await f.dispatch('services');
   assert.deepEqual(publicServices, { items: [{ serviceId: 'example', accountId: 'work', name: 'Example work account', factors: ['password', 'totp'] }], nextCursor: null, hasMore: false });
   for (const value of [TOKEN, PASSWORD, enrollment.vaultId, enrollment.itemId]) assert.equal(JSON.stringify(publicServices).includes(value), false);
-  for (const operation of ['requests', 'request.status', 'request.decide', 'request.retry', 'policies', 'policy.revoke', 'enrollments', 'enrollment.put', 'provider.put', 'peers', 'peer.revoke', 'passkey.observe', 'passkey.click', 'passkey.type', 'passkey.key']) {
+  for (const operation of ['requests', 'request.status', 'request.decide', 'request.retry', 'policies', 'policy.revoke', 'enrollments', 'enrollment.put', 'provider.put', 'providers', 'provider.check', 'provider.discovery', 'peers', 'peer.revoke', 'passkey.observe', 'passkey.click', 'passkey.type', 'passkey.key']) {
     await assert.rejects(f.dispatch(operation, { token: 'SYNTHETIC_OTHER_TOKEN_VALUE', enrollment }), /unavailable to agent/);
   }
   await assert.rejects(f.dispatch('browser.open', { serviceId: 'example' }, 'approver'), /Unknown authentication operation/);

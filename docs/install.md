@@ -1,6 +1,6 @@
 # Verified installation
 
-Requirements: macOS or Linux, Node 22+, Git with SSH-signature support,
+Requirements: macOS or Linux, Node 22+ with npm, Git with SSH-signature support,
 `ssh-keygen`, `tar`, Chrome/Chromium. macOS needs Apple Command Line Tools to build
 the small Keychain bridge (`xcode-select --install`); Linux needs Python 3 and `python3-secretstorage`
 (the `python3-secretstorage` package on Debian/Ubuntu) and an unlocked Secret Service on the user's
@@ -29,6 +29,17 @@ executing any downloaded application code. It preserves prior installed releases
 and refuses missing trust, unsigned revisions and unrelated command paths.
 Node is installed through your trusted package manager or an independently
 verified Node distribution; the installer no longer downloads an unsigned runtime.
+
+Before activating a release, the installer runs `npm ci --ignore-scripts --omit=dev`
+for its authentication dependency package in a temporary staging directory. The
+signed lockfile pins the 1Password SDK and integrity hashes. An import check loads
+the SDK and its WASM runtime without creating a client, reading credentials or
+contacting a vault. Dependency installation or validation failure leaves the
+current release and its dependencies intact. Healthy existing dependencies are
+reused; reinstalling the same signed revision repairs a missing SDK through the
+same staging process. Registry access is needed when the pinned packages are not
+already available in npm's cache. Release archives contain source and lockfiles,
+not a copied developer `node_modules` directory.
 
 `--no-setup` skips the wizard and PATH prompt. `--add-path` explicitly enables the
 PATH edit; `--no-path` disables it. Install roots remain

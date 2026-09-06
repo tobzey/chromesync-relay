@@ -47,7 +47,8 @@ are used. Observe after selecting and pass its current revision to request.
 Handoff imports authenticated cookies directly into a local managed browser.
 Some sites require login on the protected host because their sessions cannot move.
 Never pass provider tokens, passwords or OTP values as command arguments.
-Install the executor SDK first: npm ci --prefix auth --ignore-scripts
+Source checkout setup: npm ci --prefix auth --ignore-scripts
+Verified installs and updates provision the executor SDK automatically.
 The executor must run outside the agent's OS and filesystem authority.
 `;
 

@@ -13,10 +13,10 @@
 <section id="services" class="view" hidden>
 <h2>Connect your 1Password vault</h2><p>Connect once. Agents can find an account by service name or website and send it here for approval. You can guide sign-in in the protected browser without configuring each service.</p>
 <div class="card"><p>Use a read-only 1Password service account restricted to the vaults you want to share. The token goes to the executor's protected credential store.</p><form id="provider-form"><label>Connection name<input name="providerId" value="default" required pattern="[a-z0-9][a-z0-9_-]{0,63}" autocomplete="off"></label><label>Service-account token<input type="password" name="token" required autocomplete="off" spellcheck="false"></label><label><input name="discoveryEnabled" type="checkbox" checked> Let agents find accounts by service name or website</label><button class="primary" type="submit">Connect vault</button></form></div>
-<div id="provider-list"></div>
-<h2>Accounts selected by agents</h2><div id="service-list"></div><div id="service-pages" class="actions" aria-label="Service pages"></div>
+<h3>Saved connections</h3><p id="provider-status" role="status" data-state="loading">Loading saved connections…</p><div id="provider-list"></div>
+<h2>Accounts selected by agents</h2><p id="service-status" role="status" hidden></p><div id="service-list"></div><div id="service-pages" class="actions" aria-label="Service pages"></div>
 <details><summary>Advanced: configure a sign-in flow</summary><p>Optional: save a tested flow for automatic sign-in. The configuration contains field references and form selectors, never passwords or OTP seeds.</p><form id="enrollment-form"><label>Service configuration<textarea name="enrollment" rows="18" spellcheck="false" required></textarea></label><button type="button" id="example">Load example</button><button class="primary" type="submit">Save service</button></form></details>
-<h2>Paired devices</h2><div id="peer-list"></div>
+<h2>Paired devices</h2><p id="peer-status" role="status" hidden></p><div id="peer-list"></div>
 </section>
 <footer>Approval does not bypass a site's additional verification. Requests that need interaction stay pending until you complete it.</footer>
 </main></body></html>

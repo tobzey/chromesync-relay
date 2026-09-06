@@ -97,7 +97,7 @@ function fieldsOf(item) {
 // resolveAccount returns private field references, never field values. An exact
 // origin match is evidence for owner review, not permission to fill. Passkey
 // selections still require native-provider account verification.
-export function createOnePasswordCatalog({ client, now = Date.now }) {
+export function createOnePasswordCatalog({ client, now = Date.now, onHealth = () => {} }) {
   if (typeof client !== 'function') throw new Error('Catalog client required');
   const caches = new Map(), handles = new Map(), cursors = new Map();
 
@@ -113,7 +113,13 @@ export function createOnePasswordCatalog({ client, now = Date.now }) {
     for (const [key, value] of cursors) if (value.providerIds.includes(providerId)) cursors.delete(key);
   }
 
-  async function refresh(providerId) {
+  function summary(entry) {
+    return { status: 'ready', stage: 'catalog', checkedAt: entry.checkedAt, vaultCount: entry.vaults.size,
+      itemCount: [...entry.vaults.values()].reduce((total, vault) => total + vault.count, 0),
+      loginItemCount: [...entry.vaults.values()].reduce((total, vault) => total + vault.items.length, 0) };
+  }
+
+  async function refresh(providerId, force = false) {
     let entry = caches.get(providerId);
     if (!entry) {
       if (caches.size >= MAX_VAULTS) fail('capacity');
@@ -122,23 +128,33 @@ export function createOnePasswordCatalog({ client, now = Date.now }) {
     }
     if (entry.pending) return entry.pending;
     const time = now();
-    if (entry.checkedAt != null && time - entry.checkedAt < CACHE_TTL) return entry;
-    if (entry.attemptedAt != null && time - entry.attemptedAt < REFRESH_INTERVAL) fail('provider-unavailable');
+    if (!force && entry.checkedAt != null && time - entry.checkedAt < CACHE_TTL) return entry;
+    if (!force && entry.attemptedAt != null && time - entry.attemptedAt < REFRESH_INTERVAL) fail('provider-unavailable');
     entry.attemptedAt = time;
     entry.pending = (async () => {
+      let stage = 'authentication';
+      const current = () => { if (caches.get(providerId) !== entry) fail('stale-handle'); };
+      const report = update => { if (caches.get(providerId) === entry) onHealth(providerId, update); };
       try {
+        report({ status: 'checking', stage });
         const sdk = await client(providerId);
+        current();
+        stage = 'vaults'; report({ status: 'checking', stage });
         const vaults = await sdk.vaults.list({ decryptDetails: false });
+        current();
         if (!Array.isArray(vaults) || vaults.length > MAX_VAULTS) fail('capacity');
+        if (!vaults.length) throw Object.assign(new Error('No accessible vaults'), { code: 'vault-access-missing' });
         const next = new Map();
         for (const vault of vaults) {
           if (!isId(vault?.id) || next.has(vault.id)) fail('provider-unavailable');
           const previous = entry.vaults.get(vault.id);
-          if (previous && Number.isSafeInteger(vault.contentVersion) && previous.version === vault.contentVersion) {
+          if (!force && previous && Number.isSafeInteger(vault.contentVersion) && previous.version === vault.contentVersion) {
             next.set(vault.id, previous);
             continue;
           }
+          stage = 'items'; report({ status: 'checking', stage });
           const overviews = await sdk.items.list(vault.id, { type: 'ByState', content: { active: true, archived: false } });
+          current();
           if (!Array.isArray(overviews) || overviews.length > MAX_ITEMS) fail('capacity');
           const items = [], seen = new Set();
           for (const overview of overviews) {
@@ -164,8 +180,10 @@ export function createOnePasswordCatalog({ client, now = Date.now }) {
         entry.vaults = next;
         entry.checkedAt = now();
         if (changed) entry.generation = token();
+        report(summary(entry));
         return entry;
       } catch (error) {
+        report({ status: 'error', stage, error, retryAt: entry.attemptedAt + REFRESH_INTERVAL });
         if (error instanceof OnePasswordCatalogError) throw error;
         fail('provider-unavailable');
       } finally { entry.pending = null; }
@@ -183,6 +201,33 @@ export function createOnePasswordCatalog({ client, now = Date.now }) {
 
   return Object.freeze({
     reset,
+    // Internal connection-validation primitives. They never expose raw SDK
+    // objects: the snapshot contains only this module's bounded metadata index.
+    async checkConnection(providerId) { return summary(await refresh(providerId, true)); },
+    connectionSnapshot(providerId) {
+      const entry = caches.get(providerId);
+      if (!entry || entry.checkedAt == null || entry.pending) fail('provider-unavailable');
+      return structuredClone({ checkedAt: entry.checkedAt, vaults: [...entry.vaults] });
+    },
+    adoptConnection(providerId, snapshot) {
+      // Only snapshots produced by an isolated validated catalog are supplied
+      // by the provider. Evict cache data, never authority, if the combined
+      // metadata would exceed the shared budget after a connection changes.
+      const vaults = new Map(snapshot.vaults);
+      let count = 0, bytes = 0, vaultCount = 0;
+      for (const [id, cache] of [...caches].filter(([id]) => id !== providerId).concat([[providerId, { vaults }]])) {
+        for (const vault of cache.vaults.values()) {
+          count += vault.count; vaultCount++; bytes += Buffer.byteLength(JSON.stringify(vault.items));
+        }
+      }
+      if (count > MAX_ITEMS || bytes > MAX_CACHE_BYTES || vaultCount > MAX_VAULTS) {
+        caches.clear(); handles.clear(); cursors.clear();
+      } else reset(providerId);
+      const entry = { checkedAt: snapshot.checkedAt, attemptedAt: snapshot.checkedAt,
+        vaults: structuredClone(vaults), generation: token(), pending: null };
+      caches.set(providerId, entry);
+      onHealth(providerId, summary(entry));
+    },
     async searchAccounts(input = {}, requesterId) {
       const { providerIds, cursor, limit = 20 } = input;
       const origin = originOf(input.origin);

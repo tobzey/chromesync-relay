@@ -7,7 +7,7 @@ const ASSETS = new Map([
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
 ]);
-const OWNER_OPERATIONS = new Set(['requests', 'request.status', 'request.decide', 'request.retry', 'policies', 'policy.revoke', 'enrollments', 'enrollment.put', 'provider.put', 'providers', 'provider.discovery', 'peers', 'peer.revoke', 'takeover.start', 'takeover.observe', 'takeover.click', 'takeover.type', 'takeover.key', 'takeover.finish', 'passkey.observe', 'passkey.click', 'passkey.type', 'passkey.key']);
+const OWNER_OPERATIONS = new Set(['requests', 'request.status', 'request.decide', 'request.retry', 'policies', 'policy.revoke', 'enrollments', 'enrollment.put', 'provider.put', 'providers', 'provider.check', 'provider.discovery', 'peers', 'peer.revoke', 'takeover.start', 'takeover.observe', 'takeover.click', 'takeover.type', 'takeover.key', 'takeover.finish', 'passkey.observe', 'passkey.click', 'passkey.type', 'passkey.key']);
 
 function send(res, status, value, type = 'application/json') {
   const body = type === 'application/json' ? JSON.stringify(value) : value;

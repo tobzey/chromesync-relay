@@ -2,7 +2,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { createEncryptedStore } from './store.js';
 import { createBroker } from './broker.js';
-import { createOnePasswordProvider, validateOnePasswordEnrollment } from './onepassword.js';
+import { createOnePasswordProvider, validateOnePasswordEnrollment, OnePasswordConnectionError } from './onepassword.js';
 import { createRelayExecutor, createRelayCaller } from './relay.js';
 import { loadAuthSecrets, updateAuthSecrets, revokeAuthPeer } from './config.js';
 import { createManagedPasskeyProvider } from './passkeys/provider.js';
@@ -42,7 +42,8 @@ export function validateEnrollment(input) {
   return normalizeEnrollment(input);
 }
 
-export async function createAuthExecutor({ home, controller: suppliedController, providers: suppliedProviders, passkeyProvider: suppliedPasskeys, store: suppliedStore, secrets: suppliedSecrets, loadSecrets, persistProvider, io }) {
+export async function createAuthExecutor({ home, controller: suppliedController, providers: suppliedProviders, passkeyProvider: suppliedPasskeys, store: suppliedStore, secrets: suppliedSecrets, loadSecrets, persistProvider, catalogTimeoutMs = 20000, io }) {
+  if (!Number.isInteger(catalogTimeoutMs) || catalogTimeoutMs < 1 || catalogTimeoutMs > 20000) throw new Error('Invalid catalog deadline');
   const getSecrets = loadSecrets || (() => loadAuthSecrets(home));
   const secrets = suppliedSecrets || await getSecrets();
   if (secrets.identity.role !== 'executor') throw new Error('This command requires an executor identity');
@@ -95,11 +96,32 @@ export async function createAuthExecutor({ home, controller: suppliedController,
     const pending = Promise.resolve().then(work).finally(() => catalogWork.delete(requesterId));
     let timer;
     try { return await Promise.race([pending, new Promise((_, reject) => {
-      timer = setTimeout(() => reject(Object.assign(new Error('Catalog timeout'), { code: 'timeout' })), 20000);
+      timer = setTimeout(() => reject(Object.assign(new Error('Catalog timeout'), { code: 'timeout' })), catalogTimeoutMs);
     })]); } finally { clearTimeout(timer); }
   };
   const assertRequester = async requesterId => {
     if (closing || Object.hasOwn((await store.read()).revokedRequesters ?? {}, requesterId)) throw new Error('Requester unavailable');
+  };
+  const changingProviders = new Set();
+  const providerSummary = (id, record) => ({ id,
+    hasCredential: typeof record?.token === 'string' && record.token.length > 0,
+    discoveryEnabled: record?.discoveryEnabled !== false,
+    health: providers.onepassword?.diagnostics?.(id) ?? { status: 'unchecked' },
+  });
+  const providerFailure = async (id, error, stage = 'validation') => {
+    const fallback = error?.code === 'timeout'
+      ? { code: 'timeout', message: 'The connection check timed out. Check executor connectivity, then retry.' }
+      : error?.code === 'capacity'
+        ? { code: 'busy', message: 'A connection check is still running. Wait briefly, then retry.' }
+        : stage === 'storage'
+          ? { code: 'storage-unavailable', message: 'The executor could not verify the saved connection. Check its credential storage, then retry.' }
+          : { code: 'provider-unavailable', message: 'The executor could not check this connection. Update the executor and try again.' };
+    const health = error instanceof OnePasswordConnectionError ? error.diagnostic
+      : { status: 'error', stage, checkedAt: Date.now(), ...fallback };
+    let record;
+    try { record = (await getSecrets()).providers[id]; } catch { /* Storage health may itself be the failure. */ }
+    return { status: 'failed', reason: health.code, message: health.message, health,
+      ...(record ? { provider: providerSummary(id, record) } : {}) };
   };
 
   async function dispatch(operation, args, principal) {
@@ -293,24 +315,62 @@ export async function createAuthExecutor({ home, controller: suppliedController,
       }
       case 'provider.put': {
         const id = checkName(args.providerId || 'default');
-        if (typeof args.token !== 'string' || args.token.length < 20 || args.token.length > 32000) throw new Error('Invalid provider credential');
-        if (persistProvider) await persistProvider(id, args.token);
-        else await updateAuthSecrets(home, record => { record.providers[id] = { token: args.token, discoveryEnabled: args.discoveryEnabled !== false }; });
-        discoveryEpoch++;
-        providers.onepassword?.reset?.(id);
-        return { status: 'configured', providerId: id };
+        if (changingProviders.has(id)) return providerFailure(id, { code: 'capacity' });
+        changingProviders.add(id);
+        let stage = 'validation';
+        try {
+          // Validation uses a private candidate. A rejected or timed-out SDK call
+          // cannot replace the saved credential or activate a client later.
+          const candidate = await boundedCatalog(`provider:${id}`, () => providers.onepassword.prepareConnection(args.token));
+          await assertRequester(principal.id);
+          stage = 'storage';
+          const enabled = args.discoveryEnabled !== false;
+          if (persistProvider) await persistProvider(id, args.token, { discoveryEnabled: enabled });
+          else await updateAuthSecrets(home, async record => {
+            await assertRequester(principal.id);
+            record.providers[id] = { token: args.token, discoveryEnabled: enabled };
+          });
+          const record = (await getSecrets()).providers[id];
+          if (record?.token !== args.token || (record.discoveryEnabled !== false) !== enabled) throw new Error('Credential readback failed');
+          await assertRequester(principal.id);
+          discoveryEpoch++;
+          candidate.activate(id);
+          return { status: 'configured', providerId: id, provider: providerSummary(id, record) };
+        } catch (error) {
+          // Persistence can fail after committing. Invalidate the old client so
+          // future use reloads storage instead of assuming which token won.
+          if (stage === 'storage') { discoveryEpoch++; providers.onepassword?.reset?.(id); }
+          return providerFailure(id, error, stage);
+        } finally { changingProviders.delete(id); }
       }
-      case 'providers': return Object.entries((await getSecrets()).providers).map(([id, record]) => ({ id, discoveryEnabled: record.discoveryEnabled !== false }));
+      case 'providers': return Object.entries((await getSecrets()).providers).map(([id, record]) => providerSummary(id, record));
+      case 'provider.check': {
+        const id = checkName(args.providerId || 'default');
+        if (changingProviders.has(id)) return providerFailure(id, { code: 'capacity' });
+        changingProviders.add(id);
+        try {
+          const health = await boundedCatalog(`provider:${id}`, () => providers.onepassword.checkConnection(id));
+          if (health.status === 'error') throw new OnePasswordConnectionError(health);
+          await assertRequester(principal.id);
+          const record = (await getSecrets()).providers[id];
+          return { status: 'checked', providerId: id, provider: providerSummary(id, record) };
+        } catch (error) { return providerFailure(id, error); }
+        finally { changingProviders.delete(id); }
+      }
       case 'provider.discovery': {
         const id = checkName(args.providerId || 'default');
         if (typeof args.enabled !== 'boolean') throw new Error('Choose whether discovery is enabled');
-        await updateAuthSecrets(home, record => {
-          if (!record.providers[id]) throw new Error('Provider unavailable');
-          record.providers[id].discoveryEnabled = args.enabled;
-        });
-        discoveryEpoch++;
-        providers.onepassword?.reset?.(id);
-        return { status: 'configured', providerId: id, discoveryEnabled: args.enabled };
+        if (changingProviders.has(id) || catalogWork.has(`provider:${id}`)) return providerFailure(id, { code: 'capacity' });
+        changingProviders.add(id);
+        try {
+          await updateAuthSecrets(home, record => {
+            if (!record.providers[id]) throw new Error('Provider unavailable');
+            record.providers[id].discoveryEnabled = args.enabled;
+          });
+          discoveryEpoch++;
+          providers.onepassword?.reset?.(id);
+          return { status: 'configured', providerId: id, discoveryEnabled: args.enabled };
+        } finally { changingProviders.delete(id); }
       }
       case 'peers': return (await getSecrets()).peers.map(({ identity, enabled }) => ({ id: identity.id, role: identity.role, enabled }));
       case 'peer.revoke': {
@@ -355,7 +415,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
       default: throw new Error('Unknown authentication operation');
     }
   }
-  const readOnly = new Set(['services', 'requests', 'request.status', 'policies', 'enrollments', 'peers', 'providers', 'accounts.search', 'browser.export', 'browser.observe', 'auth.status', 'takeover.observe', 'passkey.observe']);
+  const readOnly = new Set(['services', 'requests', 'request.status', 'policies', 'enrollments', 'peers', 'providers', 'provider.check', 'accounts.search', 'browser.export', 'browser.observe', 'auth.status', 'takeover.observe', 'passkey.observe']);
   const relay = createRelayExecutor({ identity: secrets.identity, getPeers: async () => (await getSecrets()).peers, store, dispatch, isReadOnly: operation => readOnly.has(operation), io });
   return { broker, store, controller, dispatch, poll: () => closing ? { status: 'stopping' } : relay.poll(), close: () => closePromise ||= (async () => {
     closing = true; takeovers.clear(); discoverySessions.clear();
