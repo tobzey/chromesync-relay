@@ -44,6 +44,40 @@ function renderPages(view, page, selector) {
   if (state.history.length) container.append(action('Previous page', () => { state.cursor = state.history.pop(); requestRenderKey = undefined; }));
   if (page.hasMore) container.append(action('Next page', () => { state.history.push(state.cursor); state.cursor = page.nextCursor; requestRenderKey = undefined; }));
 }
+const seenRequestIds = new Set();
+let audioContext;
+function notifyRequests(requests, openCount) {
+  for (const request of requests) {
+    const id = request.requestId || request.id;
+    if (seenRequestIds.has(id)) continue;
+    seenRequestIds.add(id);
+    if (seenRequestIds.size > 10000) seenRequestIds.delete(seenRequestIds.values().next().value);
+    if (request.status !== 'pending') continue;
+    if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+      try {
+        const notification = new Notification('Approval needed', { body: `${request.name || request.serviceId} · ${request.origin}`, tag: id, requireInteraction: true });
+        notification.onclick = () => { window.focus(); selectView('requests'); };
+      } catch {}
+    }
+    if ($('#notification-sound').checked && audioContext?.state === 'running') {
+      [523, 659, 784].forEach((frequency, index) => {
+        const oscillator = audioContext.createOscillator(), gain = audioContext.createGain();
+        oscillator.frequency.value = frequency; gain.gain.value = 0.04;
+        oscillator.connect(gain); gain.connect(audioContext.destination);
+        oscillator.start(audioContext.currentTime + index * 0.12); oscillator.stop(audioContext.currentTime + index * 0.12 + 0.1);
+      });
+    }
+  }
+  try { Promise.resolve(navigator.setAppBadge?.(openCount)).catch(() => {}); } catch {}
+}
+function notificationPermission() {
+  $('#enable-notifications').hidden = typeof Notification === 'undefined' || Notification.permission !== 'default';
+}
+$('#enable-notifications').addEventListener('click', async () => { try { await Notification.requestPermission(); } finally { notificationPermission(); } });
+document.addEventListener('pointerdown', () => {
+  try { audioContext ||= new (window.AudioContext || window.webkitAudioContext)(); audioContext.resume().catch(() => {}); } catch {}
+});
+notificationPermission();
 function failureText(request) {
   if (request.reason === 'authentication-uncertain' && request.diagnostic?.credentialsSupplied === true) return 'Credentials were submitted but sign-in was not verified. Check the site in the protected browser before retrying.';
   const messages = {
@@ -60,6 +94,7 @@ function failureText(request) {
   return messages[request.diagnostic?.code] || 'Authentication did not complete. Review the service connection, then retry or complete it in the protected browser.';
 }
 function renderRequests(requests, hasMore, openCount = requests.length) {
+  notifyRequests(requests, openCount);
   $('#count').textContent = String(openCount);
   document.title = openCount ? `(${openCount}) ChromeSync approvals` : 'ChromeSync approvals';
   const key = JSON.stringify([requests, hasMore, openCount]);
@@ -231,13 +266,13 @@ function refresh() {
   if (!csrf) return Promise.resolve();
   const work = [refreshProviders()];
   if (!activeTakeover) {
-    if (currentView === 'requests') work.push(refreshComponent('requests', 'requests', { cursor: pages.requests.cursor }, page => {
+    work.push(refreshComponent('requests', 'requests', { cursor: pages.requests.cursor }, page => {
       renderRequests(page.items, page.hasMore, Number.isSafeInteger(page.openCount) && page.openCount >= 0 ? page.openCount : page.items.length); renderPages('requests', page, '#request-pages');
-    }));
-    else if (currentView === 'policies') work.push(refreshComponent('policies', 'policies', { cursor: pages.policies.cursor }, page => {
+    }, '#request-status'));
+    if (currentView === 'policies') work.push(refreshComponent('policies', 'policies', { cursor: pages.policies.cursor }, page => {
       renderPolicies(page.items); renderPages('policies', page, '#policy-pages');
     }));
-    else work.push(refreshComponent('services', 'enrollments', { cursor: pages.services.cursor }, page => {
+    else if (currentView === 'services') work.push(refreshComponent('services', 'enrollments', { cursor: pages.services.cursor }, page => {
       renderServices(page.items); renderPages('services', page, '#service-pages');
     }, '#service-status'), refreshComponent('peers', 'peers', {}, renderPeers, '#peer-status'));
   }

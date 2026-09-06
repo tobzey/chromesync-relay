@@ -6,7 +6,7 @@ import { withLock, writePrivate, readJson } from '../cli/config.js';
 import { authHome, initializeAuth, exportPairingRequest, approveAuthPeer, activateAuthPeer, loadAuthConfig, loadAuthSecrets } from './config.js';
 import { publicIdentity, fingerprint } from './protocol.js';
 import { createAuthExecutor, createAuthRemote } from './runtime.js';
-import { startApprovalInbox } from './inbox.js';
+import { startConfiguredApprovalInbox } from './inbox.js';
 import { openManagedPasskeyReceiverSetup } from './passkeys/provider.js';
 
 const HELP = `ChromeSync authentication — protected browser access and approvals
@@ -19,6 +19,9 @@ const HELP = `ChromeSync authentication — protected browser access and approva
   chromesync auth passkey-setup --chrome /absolute/browser --origins https://service.example
   chromesync auth executor [--port 0]           Run on the separate trusted host
   chromesync auth approvals [--port 0]          Open the daily-driver approval inbox
+  chromesync auth approvals --watch [--interval SECONDS]
+  chromesync auth requests
+  chromesync auth decide --request ID --decision once|always|deny [--factors password,totp]
   chromesync auth inbox                         Show the running local inbox URL
   chromesync auth service install|uninstall     Manage the user background service
   chromesync auth services [--cursor CURSOR]    List a page of enrolled account aliases
@@ -69,6 +72,7 @@ async function run(argv) {
     'username-handle': { type: 'string' }, 'password-handle': { type: 'string' },
     'totp-handles': { type: 'string' }, 'submit-handle': { type: 'string' },
     name: { type: 'string' }, headless: { type: 'boolean' },
+    watch: { type: 'boolean' }, interval: { type: 'string' }, decision: { type: 'string' },
   } });
   const command = positionals[0] || 'help';
   if (values.help || command === 'help') { console.log(HELP); return; }
@@ -107,9 +111,17 @@ async function run(argv) {
     });
     return;
   }
+  if (['requests', 'decide'].includes(command) || (command === 'approvals' && values.watch)) {
+    const { runApproverCommand } = await import('./approver-cli.js');
+    const controller = new AbortController();
+    const stop = () => controller.abort();
+    process.once('SIGINT', stop); process.once('SIGTERM', stop);
+    try { return await runApproverCommand(createAuthRemote(home), command, values, { output, signal: controller.signal }); }
+    finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
+  }
   if (command === 'executor' || command === 'approvals') {
-    const port = Number(values.port || 0);
-    if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid inbox port');
+    const port = values.port === undefined ? undefined : Number(values.port);
+    if (port !== undefined && (!Number.isInteger(port) || port < 0 || port > 65535)) throw new Error('Invalid inbox port');
     const controller = new AbortController();
     const stop = () => controller.abort();
     process.once('SIGINT', stop); process.once('SIGTERM', stop);
@@ -120,14 +132,15 @@ async function run(argv) {
           if (command === 'executor') {
             executor = await createAuthExecutor({ home });
             const principal = publicIdentity(loadAuthSecrets(home).identity);
-            inbox = await startApprovalInbox({ port, role: 'executor', call: (operation, args) => executor.dispatch(operation, args, principal) });
+            inbox = await startConfiguredApprovalInbox({ home, port, role: 'executor', call: (operation, args) => executor.dispatch(operation, args, principal) });
           } else {
             if (loadAuthConfig(home).role !== 'approver') throw new Error('The approval inbox requires an approver identity');
             const remote = createAuthRemote(home);
-            inbox = await startApprovalInbox({ port, call: (operation, args) => remote.call(operation, args) });
+            inbox = await startConfiguredApprovalInbox({ home, port, call: (operation, args) => remote.call(operation, args) });
           }
           writePrivate(path.join(home, 'inbox.json'), { pid: process.pid, url: inbox.url, role: command });
-          output({ status: 'ready', role: command, approvalInbox: inbox.url });
+          output({ status: 'ready', role: command, approvalInbox: inbox.url, ...(inbox.portFallback ? { portFallback: true } : {}) });
+          if (inbox.portFallback) console.error('Saved inbox port is busy. Using a new local port; enable notifications in this inbox if needed.');
           let lastRejectionWarning = 0;
           while (!controller.signal.aborted) {
             if (executor) {

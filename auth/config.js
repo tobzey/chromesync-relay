@@ -12,7 +12,14 @@ const configPath = home => path.join(home, 'config.json');
 export function loadAuthConfig(home = authHome()) {
   const config = readJson(configPath(home));
   if (config.version !== 1 || !['executor', 'agent', 'approver'].includes(config.role) || !/^[a-f0-9]{64}$/.test(config.secretRef)) throw new Error('Invalid authentication configuration');
+  if (config.inboxPort !== undefined && (!Number.isInteger(config.inboxPort) || config.inboxPort < 1 || config.inboxPort > 65535)) throw new Error('Invalid inbox port');
   return config;
+}
+export async function saveInboxPort(home, port) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid inbox port');
+  return withLock(home, 'authentication-configuration', async () => {
+    writePrivate(configPath(home), { ...loadAuthConfig(home), inboxPort: port });
+  });
 }
 export function loadAuthSecrets(home = authHome()) {
   return loadCredentials(loadAuthConfig(home).secretRef);

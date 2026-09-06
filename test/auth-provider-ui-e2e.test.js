@@ -94,7 +94,7 @@ test('provider cards survive reload and unrelated failures; connection actions n
       await refreshProviders();
       await until(async () => (await state()).cards.length === 1, 'connections load when Vault and devices opens');
       requests.reject(new Error('Synthetic request-list failure'));
-      await until(() => page(() => !document.querySelector('#notice').hidden), 'request-list failure is reported independently');
+      await until(() => page(() => !document.querySelector('#request-status').hidden), 'request-list failure is reported independently');
       assert.equal((await state()).cards[0].id, 'default', 'a failed request list does not clear the saved connection');
       await refreshProviders();
       await until(async () => (await state()).status === 'ready', 'provider status is ready independently of failed services and peers');

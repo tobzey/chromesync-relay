@@ -195,3 +195,25 @@ test('configuration locks do not retry listener errors other than address conten
     assert.equal(calls, 0);
   } finally { net.Server.prototype.listen = original; }
 });
+
+test('inbox persists its loopback port, reuses it and falls back only when a saved port is occupied', async t => {
+  const { startConfiguredApprovalInbox } = await import('../auth/inbox.js');
+  const f = await fixture(t), home = f.homes.approver;
+  const options = { home, call: async () => ({}) };
+  const first = await startConfiguredApprovalInbox(options);
+  const port = Number(new URL(first.url).port);
+  assert.equal(loadAuthConfig(home).inboxPort, port);
+  await first.close();
+  const second = await startConfiguredApprovalInbox(options);
+  t.after(() => second.close());
+  assert.equal(new URL(second.url).hostname, '127.0.0.1');
+  assert.equal(Number(new URL(second.url).port), port);
+  const fallback = await startConfiguredApprovalInbox(options);
+  t.after(() => fallback.close());
+  assert.equal(fallback.portFallback, true);
+  assert.notEqual(Number(new URL(fallback.url).port), port);
+  assert.equal(loadAuthConfig(home).inboxPort, Number(new URL(fallback.url).port));
+  const override = await startConfiguredApprovalInbox({ ...options, port: 0 });
+  t.after(() => override.close());
+  assert.equal(loadAuthConfig(home).inboxPort, Number(new URL(override.url).port));
+});

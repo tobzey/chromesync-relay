@@ -1,3 +1,4 @@
+import { loadAuthConfig, saveInboxPort } from './config.js';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
@@ -7,7 +8,7 @@ const ASSETS = new Map([
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
 ]);
-const OWNER_OPERATIONS = new Set(['requests', 'request.status', 'request.decide', 'request.retry', 'policies', 'policy.revoke', 'enrollments', 'enrollment.put', 'provider.put', 'providers', 'provider.check', 'provider.discovery', 'peers', 'peer.revoke', 'takeover.start', 'takeover.observe', 'takeover.click', 'takeover.type', 'takeover.key', 'takeover.finish', 'passkey.observe', 'passkey.click', 'passkey.type', 'passkey.key']);
+export const OWNER_OPERATIONS = new Set(['requests', 'request.status', 'request.decide', 'request.retry', 'policies', 'policy.revoke', 'enrollments', 'enrollment.put', 'provider.put', 'providers', 'provider.check', 'provider.discovery', 'peers', 'peer.revoke', 'takeover.start', 'takeover.observe', 'takeover.click', 'takeover.type', 'takeover.key', 'takeover.finish', 'passkey.observe', 'passkey.click', 'passkey.type', 'passkey.key']);
 
 function send(res, status, value, type = 'application/json') {
   const body = type === 'application/json' ? JSON.stringify(value) : value;
@@ -60,4 +61,18 @@ export async function startApprovalInbox({ call, port = 0, role = 'approver' }) 
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen({ host: '127.0.0.1', port }, resolve); });
   origin = `http://127.0.0.1:${server.address().port}`;
   return { url: origin, server, close: () => new Promise(resolve => { server.close(resolve); server.closeIdleConnections(); }) };
+}
+
+// A stable loopback origin preserves the browser's notification permission.
+export async function startConfiguredApprovalInbox({ home, port, ...options }) {
+  const saved = loadAuthConfig(home).inboxPort;
+  let inbox, portFallback = false;
+  try { inbox = await startApprovalInbox({ ...options, port: port ?? saved ?? 0 }); }
+  catch (error) {
+    if (port !== undefined || !saved || error.code !== 'EADDRINUSE') throw error;
+    inbox = await startApprovalInbox({ ...options, port: 0 }); portFallback = true;
+  }
+  try { await saveInboxPort(home, Number(new URL(inbox.url).port)); }
+  catch (error) { await inbox.close(); throw error; }
+  return { ...inbox, portFallback };
 }

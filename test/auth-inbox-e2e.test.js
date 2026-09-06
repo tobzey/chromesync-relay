@@ -25,8 +25,8 @@ test('approval inbox preserves factor choices, paginates, and privately drives a
     const inbox=await startApprovalInbox({call:async(operation,args)=>{
       calls.push({operation,args:structuredClone(args)});
       if(operation==='requests') return args.cursor==='synthetic-page-2'
-        ? {items:passkey.status==='succeeded'?[]:[structuredClone(passkey)],nextCursor:null,hasMore:false}
-        : {items:[structuredClone(password)],nextCursor:'synthetic-page-2',hasMore:true};
+        ? {openCount:2,items:passkey.status==='succeeded'?[]:[structuredClone(passkey)],nextCursor:null,hasMore:false}
+        : {openCount:2,items:[structuredClone(password)],nextCursor:'synthetic-page-2',hasMore:true};
       if(['policies','enrollments'].includes(operation)) return {items:[],nextCursor:null,hasMore:false};
       if(['peers','providers'].includes(operation)) return [];
       if(operation==='request.decide') {
@@ -91,8 +91,11 @@ test('approval inbox preserves factor choices, paginates, and privately drives a
         await send('Input.dispatchMouseEvent',{type:'mouseReleased',...position,button:'left',clickCount:1});
         await delay(30);await idle();
       };
+      await send('Page.addScriptToEvaluateOnNewDocument', { source: `window.notifications=[]; window.Notification=class { static permission='granted'; constructor(title,options){window.notifications.push({title,...options});} };` });
       await send('Page.navigate',{url:inbox.url});
       await until(()=>page(()=>document.querySelector('#request-list h2')?.textContent==='Work workspace'),'initial request rendered');
+      assert.deepEqual(await page(() => window.notifications.map(n => n.tag)), ['password-request']);
+      assert.equal(await page(() => document.title), '(2) ChromeSync approvals');
       const ax=await send('Accessibility.getFullAXTree');
       assert.ok(ax.nodes.some(node=>node.role?.value==='button'&&node.name?.value==='Next page'),'pagination is an accessible button');
       await click('#request-list input[value="totp"]');
@@ -103,8 +106,10 @@ test('approval inbox preserves factor choices, paginates, and privately drives a
       await until(()=>page(()=>document.querySelector('#request-list h2')?.textContent==='Work workspace refreshed'),'updated request rendered');
       assert.deepEqual(await page(()=>({totp:document.querySelector('input[value="totp"]').checked,password:document.querySelector('input[value="password"]').checked,days:document.querySelector('#request-list select').value})),
         {totp:false,password:true,days:'1'});
+      assert.equal(await page(() => window.notifications.filter(n => n.tag === 'password-request').length), 1);
       await click('#request-pages button','Next page');
       await until(()=>page(()=>document.querySelector('#request-list h2')?.textContent==='Passkey workspace'),'next page rendered');
+      assert.deepEqual(await page(() => window.notifications.map(n => n.tag)), ['password-request', 'passkey-request']);
       assert.ok((await send('Accessibility.getFullAXTree')).nodes.some(node=>node.role?.value==='button'&&node.name?.value==='Previous page'));
       await click('#request-pages button','Previous page');
       assert.equal(await page(()=>document.querySelector('input[value="totp"]').checked),false);
