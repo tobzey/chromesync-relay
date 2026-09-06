@@ -7,11 +7,12 @@ let savedProviders, providerRevision = 0, providerRenderKey;
 const preferences = new Map();
 const pages = Object.fromEntries(['requests', 'policies', 'services'].map(name => [name, { cursor: null, history: [] }]));
 let requestRenderKey;
-let activeTakeover, captureBusy = false;
+let activeTakeover, captureBusy = false, capturePromise, captureTimer, actionPending = false;
 const $ = selector => document.querySelector(selector);
 function element(tag, text, className) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; }
 function notice(text) { $('#notice').textContent = text; $('#notice').hidden = false; }
 async function call(operation, args = {}, { timeoutMs, allowFailed = false } = {}) {
+  if (/^(takeover|passkey)\./.test(operation)) timeoutMs ??= 30000;
   const controller = timeoutMs ? new AbortController() : undefined;
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
   try {
@@ -139,7 +140,7 @@ function renderRequests(requests, hasMore, openCount = requests.length) {
     };
     const actions = element('div', undefined, 'actions'); actions.append(action('Deny', () => decide('deny'), 'deny'));
     if (request.status === 'pending') actions.append(action('Allow once', () => decide('once')), action('Always allow selected', () => decide('always'), 'primary'));
-    if (['pending', 'needs-user', 'failed'].includes(request.status)) actions.append(action('Complete in protected browser', () => beginTakeover(requestId)));
+    if (['pending', 'needs-user', 'failed'].includes(request.status) && request.sessionOpen !== false) actions.append(action('Complete in protected browser', () => beginTakeover(requestId)));
     if (['needs-user', 'failed'].includes(request.status)) actions.append(action('Review and retry', async () => { await call('request.retry', { requestId }); notice('The current browser challenge was checked. A new request requires your approval.'); }));
     if (request.status === 'authenticating' && request.factors.includes('passkey')) actions.append(action('Open 1Password prompt', () => beginReceiver(requestId), 'primary'));
     card.append(actions); list.append(card);
@@ -293,8 +294,14 @@ document.querySelectorAll('[data-view]').forEach(button => button.addEventListen
 }));
 window.addEventListener('hashchange', () => { if (!activeTakeover) { selectView(viewFromHash()); refresh(); } });
 selectView(currentView);
-async function capture() {
-  if (!activeTakeover || captureBusy) return;
+function capture() {
+  if (!activeTakeover || captureBusy || actionPending) return Promise.resolve();
+  clearTimeout(captureTimer);
+  capturePromise = performCapture();
+  return capturePromise;
+}
+async function performCapture() {
+  let retryDelay = 1500;
   captureBusy = true;
   try {
     const interaction = activeTakeover;
@@ -302,6 +309,8 @@ async function capture() {
       ? await call('passkey.observe', { requestId: interaction.requestId, targetHandle: interaction.chosenTargetHandle })
       : await call('takeover.observe', { takeoverId: interaction.takeoverId });
     if (activeTakeover !== interaction) return;
+    $('#takeover-status').textContent = '';
+    if (Number.isSafeInteger(view.expiresAt)) activeTakeover.expiresAt = view.expiresAt;
     activeTakeover.width = view.width; activeTakeover.height = view.height;
     $('#takeover-origin').textContent = view.origin;
     $('#takeover-image').src = `data:image/jpeg;base64,${view.image}`;
@@ -311,22 +320,26 @@ async function capture() {
       for (const target of view.targets) { const option = element('option', target.label); option.value = target.handle; option.selected = target.handle === view.targetHandle; select.append(option); }
     }
   } catch (error) {
+    retryDelay = 5000;
+    $('#takeover-status').textContent = 'Waiting for the protected browser…';
     if (activeTakeover?.mode === 'receiver') {
-      const status = await call('request.status', { requestId: activeTakeover.requestId }).catch(() => null);
+      const status = await call('request.status', { requestId: activeTakeover.requestId }, { timeoutMs: 5000 }).catch(() => null);
       if (status && !['pending', 'approved', 'authenticating'].includes(status.status)) {
         leaveInteraction();
         notice(status.status === 'succeeded' ? 'Authentication verified. The agent can continue.' : 'The ceremony ended without verified authentication. Review the request to continue.');
         await refresh();
       } else {
         if (activeTakeover) activeTakeover.chosenTargetHandle = undefined;
-        notice('Waiting for the 1Password prompt. Native system prompts require access to the executor.');
+        $('#takeover-status').textContent = 'Waiting for the 1Password prompt. Native system prompts require access to the executor.';
       }
-    } else notice(error.message);
+    }
   }
-  finally { captureBusy = false; }
+  finally { captureBusy = false; if (activeTakeover) captureTimer = setTimeout(capture, retryDelay); }
 }
 async function beginTakeover(requestId) {
-  activeTakeover = { ...await call('takeover.start', { requestId }), mode: 'source', requestId };
+  const result = await call('takeover.start', { requestId }, { allowFailed: true });
+  if (result.status === 'failed') { notice(result.reason === 'session-closed' ? 'The protected browser for this request is no longer open. Ask the agent to open a new session and request again.' : 'Protected browser capacity is full. Finish another takeover first.'); return; }
+  activeTakeover = { ...result, mode: 'source', requestId };
   showInteraction(); await capture();
 }
 async function beginReceiver(requestId) {
@@ -350,24 +363,27 @@ function showInteraction() {
   $('#takeover').hidden = false;
 }
 async function takeoverAction(operation, args = {}) {
-  if (!activeTakeover || captureBusy) return;
+  if (!activeTakeover || actionPending) return;
+  actionPending = true; clearTimeout(captureTimer);
+  await capturePromise;
+  if (!activeTakeover) { actionPending = false; return; }
   captureBusy = true;
   try {
     const receiver = activeTakeover.mode === 'receiver';
     await call(receiver ? operation.replace('takeover.', 'passkey.') : operation, receiver
       ? { requestId: activeTakeover.requestId, targetHandle: activeTakeover.targetHandle, ...args }
       : { takeoverId: activeTakeover.takeoverId, ...args });
-  } finally { captureBusy = false; }
+  } finally { captureBusy = false; actionPending = false; if (activeTakeover) captureTimer = setTimeout(capture, 1500); }
   await capture();
 }
 $('#takeover-image').addEventListener('click', async event => {
-  if (!activeTakeover || captureBusy || !activeTakeover.width) return;
+  if (!activeTakeover || !activeTakeover.width) return;
   const bounds = event.target.getBoundingClientRect();
   try { await takeoverAction('takeover.click', { x: Math.round((event.clientX - bounds.left) / bounds.width * activeTakeover.width), y: Math.round((event.clientY - bounds.top) / bounds.height * activeTakeover.height) }); }
   catch (error) { notice(error.message); }
 });
 $('#takeover-form').addEventListener('submit', async event => {
-  event.preventDefault(); if (captureBusy) return;
+  event.preventDefault();
   const text = $('#takeover-text').value; $('#takeover-text').value = '';
   try { await takeoverAction('takeover.type', { text, clear: $('#takeover-clear').checked }); } catch (error) { notice(error.message); }
 });
@@ -375,14 +391,19 @@ for (const [selector, key] of [['#takeover-tab', 'Tab'], ['#takeover-enter', 'En
 $('#receiver-target').addEventListener('change', () => { if (activeTakeover?.mode === 'receiver') { activeTakeover.chosenTargetHandle = $('#receiver-target').value; capture(); } });
 $('#takeover-refresh').addEventListener('click', capture);
 function leaveInteraction() {
+  clearTimeout(captureTimer);
+  $('#takeover-status').textContent = '';
   activeTakeover = undefined; $('#takeover-image').removeAttribute('src'); $('#takeover-text').value = ''; $('#takeover').hidden = true;
   $('#takeover-confirm').checked = false; $('#takeover-confirm-label').hidden = true;
   selectView('requests'); requestRenderKey = undefined;
 }
 async function finishTakeover(cancel) {
-  if (!activeTakeover || captureBusy) return;
+  if (!activeTakeover || actionPending) return;
+  actionPending = true; clearTimeout(captureTimer);
+  await capturePromise;
+  if (!activeTakeover) { actionPending = false; return; }
   const adaptive = activeTakeover.mode === 'source' && activeTakeover.adaptive === true;
-  if (!cancel && adaptive && !$('#takeover-confirm').checked) { notice('Check the signed-in account, then confirm it before handing off the session.'); return; }
+  if (!cancel && adaptive && !$('#takeover-confirm').checked) { notice('Check the signed-in account, then confirm it before handing off the session.'); actionPending = false; captureTimer = setTimeout(capture, 1500); return; }
   captureBusy = true;
   try {
     if (activeTakeover.mode === 'receiver') {
@@ -397,7 +418,7 @@ async function finishTakeover(cancel) {
     if (cancel) {
       leaveInteraction(); notice('This view is closed. The executor has not confirmed that authentication stopped; check the request status.'); await refresh();
     } else notice(error.message);
-  } finally { captureBusy = false; }
+  } finally { captureBusy = false; actionPending = false; if (activeTakeover) captureTimer = setTimeout(capture, 1500); }
 }
 $('#takeover-confirm').addEventListener('change', () => {
   if (activeTakeover?.mode === 'source' && activeTakeover.adaptive === true) $('#takeover-done').disabled = !$('#takeover-confirm').checked;
@@ -447,7 +468,8 @@ $('#example').addEventListener('click', () => {
 });
 (async () => {
   const response = await fetch('/api/bootstrap'); ({ csrf } = await response.json());
-  const poll = async () => { await refresh(); if (activeTakeover?.mode === 'receiver') await capture(); setTimeout(poll, document.hidden ? 10000 : 3000); };
+  const poll = async () => { await refresh(); setTimeout(poll, document.hidden ? 10000 : 3000); };
   setTimeout(poll, document.hidden ? 10000 : 3000);
+  setInterval(() => { const seconds = Math.ceil(((activeTakeover?.expiresAt || 0) - Date.now()) / 1000); $('#takeover-expiry').textContent = activeTakeover?.expiresAt && seconds < 60 ? (seconds > 0 ? `Protected view expires in ${seconds} seconds.` : 'Protected view lease expired. Reopen it from the request.') : ''; }, 1000);
   await refresh();
 })().catch(() => { providerStatus('Connection status is unknown. Reload this trusted approval window to reconnect.', 'error'); notice('Reload this trusted approval window to reconnect.'); });

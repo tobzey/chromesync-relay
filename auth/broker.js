@@ -523,7 +523,7 @@ function invalidatePolicy(state, policy, time, approverId) {
       await initialize();
       return store.mutate((state) => {
         expire(state, now());
-        return state.requests.filter(needsAttention).map(pendingView);
+        return state.requests.filter(needsAttention).map(row => ({ ...pendingView(row), sessionOpen: controller.hasSession?.(row.sessionId) ?? true }));
       });
     },
 
@@ -532,7 +532,7 @@ function invalidatePolicy(state, policy, time, approverId) {
       return store.mutate((state) => {
         expire(state, now());
         const items = state.requests.filter(needsAttention).map(row => {
-          const view = pendingView(row);
+          const view = { ...pendingView(row), sessionOpen: controller.hasSession?.(row.sessionId) ?? true };
           if (!includeEnrollment) return view;
           const enrollment = state.enrollments.find(item => item.serviceId === row.serviceId);
           return { ...view, name: enrollment?.name,

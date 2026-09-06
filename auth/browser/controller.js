@@ -405,9 +405,12 @@ export function createBrowserController({chromePath, profileRoot, services = [],
 
   async function takeoverOperation(id,operation) {
     const lease = takeovers.get(id);
-    if (!lease?.active || lease.session.closed || lease.session.lease !== lease) fail('TAKEOVER_NOT_FOUND');
+    if (!lease?.active || lease.session.closed || lease.session.lease !== lease || lease.deadline <= Date.now()) fail('TAKEOVER_NOT_FOUND');
     if (lease.busy) fail('SESSION_BUSY');
     lease.session.lastActivityAt = Date.now();
+    lease.deadline = Math.min(Date.now() + lease.durationMs, lease.maxDeadline);
+    clearTimeout(lease.timer);
+    lease.timer = setTimeout(() => releaseTakeover(lease, true), Math.max(1, lease.deadline - Date.now()));
     lease.busy = true;
     try {
       await actualFrame(lease.session,lease.signal);
@@ -416,6 +419,8 @@ export function createBrowserController({chromePath, profileRoot, services = [],
   }
 
   const api=Object.freeze({
+    hasSession(id) { return sessions.has(id) && !sessions.get(id).closed; },
+    hasTakeover(id) { const lease = takeovers.get(id); return !!lease?.active && !lease.session.closed && lease.deadline > Date.now(); },
     validateService(service) {
       normalizeService(service,testing);
       return {status:'valid'};
@@ -677,7 +682,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
       if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 1800000) fail('INVALID_TIMEOUT');
       const abortController = new AbortController();
       const lease = {id:randomUUID(),kind:'takeover',session,active:true,busy:false,abortController,
-        signal:abortController.signal,deadline:Date.now()+timeoutMs};
+        signal:abortController.signal,deadline:Date.now()+timeoutMs,durationMs:timeoutMs,maxDeadline:Date.now()+1800000};
       session.lease=lease;
       session.quarantined=true;
       session.handles.clear();
@@ -685,7 +690,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
       takeovers.set(lease.id,lease);
       try {
         const current = await inspect(session,lease.signal);
-        return {takeoverId:lease.id,sessionId:session.id,origin:current.origin,purpose:current.purpose};
+        return {takeoverId:lease.id,sessionId:session.id,origin:current.origin,purpose:current.purpose,expiresAt:lease.deadline};
       } catch (error) {releaseTakeover(lease,true);throw error;}
     },
     takeoverObserve(takeoverId) {
@@ -705,7 +710,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
         if (!data) fail('SCREENSHOT_TOO_LARGE','The private browser image exceeds the transport limit.');
         if (!lease.active) fail('TAKEOVER_NOT_FOUND');
         lease.viewport={width,height};
-        return {takeoverId,sessionId:session.id,origin:current.origin,purpose:current.purpose,width,height,format:'jpeg',image:data};
+        return {takeoverId,sessionId:session.id,origin:current.origin,purpose:current.purpose,width,height,format:'jpeg',image:data,expiresAt:lease.deadline};
       });
     },
     takeoverClick(takeoverId,{x,y} = {}) {

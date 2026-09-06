@@ -73,6 +73,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
   const providers = suppliedProviders || { onepassword, ...(passkeys ? { passkey: passkeys.provider } : {}) };
   const broker = createBroker({ store, controller, providers });
   const takeovers = new Map();
+  const startingTakeovers = new Map();
   const updatingServices = new Set(), blockedServices = new Set();
   let discoveryEpoch = 0;
   let closing = false, closePromise;
@@ -382,6 +383,9 @@ export async function createAuthExecutor({ home, controller: suppliedController,
       case 'peers': return (await getSecrets()).peers.map(({ identity, enabled }) => ({ id: identity.id, role: identity.role, enabled }));
       case 'peer.revoke': {
         const result = await revokeAuthPeer(home, args.peerId);
+        const revokedTakeovers = [...takeovers].filter(([, entry]) => entry.approverId === args.peerId || entry.requesterId === args.peerId);
+        for (const [id] of revokedTakeovers) takeovers.delete(id);
+        await Promise.allSettled(revokedTakeovers.map(([id]) => controller.finishTakeover(id, { cancel: true })));
         await broker.revokeRequester(args.peerId, principal.id);
         await controller.closeRequester?.(args.peerId);
         for (const [id, session] of discoverySessions) if (session.ownerId === args.peerId) discoverySessions.delete(id);
@@ -391,16 +395,33 @@ export async function createAuthExecutor({ home, controller: suppliedController,
         const request = (await broker.listPending()).find(item => item.requestId === args.requestId);
         if (!request) throw new Error('Request unavailable');
         for (const [id, entry] of takeovers) {
-          if (entry.expiresAt <= Date.now()) takeovers.delete(id);
+          if (controller.hasTakeover ? !controller.hasTakeover(id) : entry.expiresAt <= Date.now()) takeovers.delete(id);
           else if (entry.sessionId === request.sessionId) {
             if (entry.approverId !== principal.id) throw Object.assign(new Error('Another approver controls this browser'), { code: 'SESSION_BUSY' });
             return entry.view;
           }
         }
         const enrollment = (await store.read()).enrollments.find(item => item.serviceId === request.serviceId);
-        const entry = { ...await controller.startTakeover(request.sessionId), adaptive: enrollment?.authentication?.mode === 'adaptive' };
-        takeovers.set(entry.takeoverId, { sessionId: request.sessionId, approverId: principal.id, expiresAt: Date.now() + 600000, view: entry });
-        return entry;
+        const starting = [...startingTakeovers.values()].reduce((sum, count) => sum + count, 0);
+        const owned = [...takeovers.values()].filter(entry => entry.approverId === principal.id).length;
+        if (takeovers.size + starting >= 8 || owned + (startingTakeovers.get(principal.id) || 0) >= 2) return { status: 'failed', reason: 'takeover-capacity' };
+        startingTakeovers.set(principal.id, (startingTakeovers.get(principal.id) || 0) + 1);
+        let started;
+        try {
+          started = await controller.startTakeover(request.sessionId);
+          await assertRequester(principal.id);
+          await assertRequester(request.requesterId);
+          const entry = { ...started, adaptive: enrollment?.authentication?.mode === 'adaptive' };
+          takeovers.set(entry.takeoverId, { sessionId: request.sessionId, requesterId: request.requesterId, approverId: principal.id, expiresAt: entry.expiresAt ?? Date.now() + 600000, view: entry });
+          return entry;
+        } catch (error) {
+          if (started) await controller.finishTakeover(started.takeoverId, { cancel: true }).catch(() => {});
+          if (['SESSION_NOT_FOUND', 'SESSION_CLOSED'].includes(error?.code)) return { status: 'failed', reason: 'session-closed' };
+          throw error;
+        } finally {
+          const count = startingTakeovers.get(principal.id) - 1;
+          if (count) startingTakeovers.set(principal.id, count); else startingTakeovers.delete(principal.id);
+        }
       }
       case 'takeover.observe': takeover(); return controller.takeoverObserve(args.takeoverId);
       case 'takeover.click': takeover(); return controller.takeoverClick(args.takeoverId, { x: args.x, y: args.y });
@@ -408,9 +429,10 @@ export async function createAuthExecutor({ home, controller: suppliedController,
       case 'takeover.key': takeover(); return controller.takeoverKey(args.takeoverId, args.key);
       case 'takeover.finish': {
         const entry = takeover();
-        const result = await controller.finishTakeover(args.takeoverId, { cancel: args.cancel === true, confirmAuthenticated: args.confirmAuthenticated === true });
-        takeovers.delete(args.takeoverId);
-        return result.status === 'authenticated' ? broker.completeTakeover(entry.sessionId, principal.id) : result;
+        try {
+          const result = await controller.finishTakeover(args.takeoverId, { cancel: args.cancel === true, confirmAuthenticated: args.confirmAuthenticated === true });
+          return result.status === 'authenticated' ? broker.completeTakeover(entry.sessionId, principal.id) : result;
+        } finally { takeovers.delete(args.takeoverId); }
       }
       case 'passkey.observe': {
         const request = await receiver();

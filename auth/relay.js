@@ -1,7 +1,7 @@
 import { readOnly } from './operations.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { relayPush, relayList, relayGet, relayDelete } from '../companion/relay-client.js';
-import { sealMessage, openMessage, newId, messageName, MESSAGE_TTL } from './protocol.js';
+import { sealMessage, openMessage, newId, messageName, MESSAGE_TTL, MAX_MESSAGE_BYTES } from './protocol.js';
 import { compactAuthState, authJournalBytes, AUTH_JOURNAL_ADMISSION_BUDGET, AUTH_CACHED_RESPONSE_LIMIT } from './store.js';
 
 const DEFAULT_IO = { push: relayPush, list: relayList, get: relayGet, delete: relayDelete };
@@ -73,7 +73,7 @@ export function createRelayCaller({ identity, peer, io = DEFAULT_IO, now = Date.
   };
 }
 
-export function createRelayExecutor({ identity, getPeers, store, dispatch, isReadOnly = () => false, isEphemeral = operation => operation === 'auth.wait', io = DEFAULT_IO, now = Date.now }) {
+export function createRelayExecutor({ identity, getPeers, store, dispatch, isReadOnly = () => false, isEphemeral = operation => ['auth.wait', 'takeover.observe', 'passkey.observe'].includes(operation), io = DEFAULT_IO, now = Date.now }) {
   let polling = false, rejectedEnvelopes = 0;
   const active = new Set();
   const jobs = new Set();
@@ -154,6 +154,7 @@ export function createRelayExecutor({ identity, getPeers, store, dispatch, isRea
           const encode = (result) => sealMessage({ type: 'response', replyTo: header.id, ...result }, identity, peer.identity, { now: now() }).toString('base64url');
           const oversized = () => ({ ok: true, result: { status: readOnly ? 'failed' : 'uncertain', reason: 'response-capacity', commandId: header.id } });
           try { response = encode(outcome); } catch { response = encode(oversized()); }
+          if (Buffer.byteLength(response, 'base64url') > MAX_MESSAGE_BYTES) response = encode(oversized());
           if (!readOnly && response.length > (cleanup ? 2048 : AUTH_CACHED_RESPONSE_LIMIT)) response = encode(oversized());
           if (!ephemeralRead && !rejected) await store.mutate(state => {
             state.transport[commandKey] = { status: 'done', expiresAt: header.expiresAt, ...(readOnly ? { readOnly: true } : { response }) };

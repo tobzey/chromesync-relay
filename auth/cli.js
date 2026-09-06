@@ -137,7 +137,7 @@ async function run(argv) {
           } else {
             if (loadAuthConfig(home).role !== 'approver') throw new Error('The approval inbox requires an approver identity');
             const remote = createAuthRemote(home);
-            inbox = await startConfiguredApprovalInbox({ home, port, call: (operation, args) => remote.call(operation, args) });
+            inbox = await startConfiguredApprovalInbox({ home, port, call: (operation, args, options) => remote.call(operation, args, options) });
           }
           writePrivate(path.join(home, 'inbox.json'), { pid: process.pid, url: inbox.url, role: command });
           output({ status: 'ready', role: command, approvalInbox: inbox.url, ...(inbox.portFallback ? { portFallback: true } : {}) });

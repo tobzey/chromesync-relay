@@ -52,7 +52,7 @@ export async function startApprovalInbox({ call, port = 0, role = 'approver' }) 
       if (req.method !== 'POST' || route !== '/api' || req.headers.origin !== origin || req.headers['x-csrf-token'] !== csrf || req.headers['content-type'] !== 'application/json') return send(res, 403, { error: 'Request rejected' });
       const body = await readBody(req);
       if (!OWNER_OPERATIONS.has(body.operation)) return send(res, 403, { error: 'Operation unavailable' });
-      const result = await call(body.operation, body.args || {});
+      const result = await call(body.operation, body.args || {}, /^(takeover|passkey)\./.test(body.operation) ? { timeoutMs: 30000 } : {});
       return send(res, 200, { result });
     } catch (error) { send(res, 400, { error: 'Operation failed. Check the executor connection and enrollment.', code: typeof error?.code === 'string' && /^[A-Z_]{1,40}$/.test(error.code) ? error.code : 'OPERATION_REJECTED' }); }
   });

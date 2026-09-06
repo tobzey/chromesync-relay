@@ -17,7 +17,7 @@ test('approval inbox preserves factor choices, paginates, and privately drives a
   {skip:enabled?false:'Set CHROMESYNC_AUTH_BROWSER_E2E=1 for the disposable approval inbox browser test.',timeout:60000},async()=>{
     const profileRoot=await mkdtemp(path.join(tmpdir(),'chromesync-inbox-e2e-'));
     const protectedText='SYNTHETIC_PROVIDER_UNLOCK_92734';
-    const calls=[];
+    const calls=[]; let sourceFrames = 0, sourceFailure = false;
     const password={requestId:'password-request',serviceId:'work',name:'Work workspace',accountId:'Work account',requesterId:'synthetic-agent',
       origin:'https://accounts.example.test',purpose:'reauthentication',factors:['password','totp'],status:'pending'};
     const passkey={requestId:'passkey-request',serviceId:'passkeys',name:'Passkey workspace',accountId:'Passkey account',requesterId:'synthetic-agent',
@@ -41,6 +41,9 @@ test('approval inbox preserves factor choices, paginates, and privately drives a
         return{origin:passkey.origin,format:'jpeg',image:JPEG,width:1,height:1,targetHandle:'synthetic-provider-target',
           targets:[{handle:'synthetic-provider-target',label:'1Password provider fixture'}]};
       }
+      if(operation==='takeover.start') return { takeoverId: 'synthetic-takeover' };
+      if(operation==='takeover.observe') { sourceFrames++; if (sourceFailure) return { status: 'uncertain' }; return { format: 'jpeg', image: JPEG, width: 1, height: 1, origin: password.origin }; }
+      if(operation==='takeover.finish') return { status: 'needs-user' };
       if(operation==='passkey.type') return{status:'ok'};
       throw new Error(`Unexpected fixture operation: ${operation}`);
     }});
@@ -119,9 +122,16 @@ test('approval inbox preserves factor choices, paginates, and privately drives a
       const selected=calls.find(call=>call.operation==='request.decide'&&call.args.requestId===password.requestId).args;
       assert.deepEqual({...selected,expiresAt:undefined},{requestId:password.requestId,decision:'always',factors:['password'],purposes:['reauthentication'],expiresAt:undefined});
       assert.ok(selected.expiresAt>=approvalStarted+86400000&&selected.expiresAt<=Date.now()+86400000);
+      await click('#request-list button','Complete in protected browser');
+      await until(() => sourceFrames >= 2, 'source mode captures again without a click', 4000);
+      sourceFailure = true;
+      await until(() => page(() => document.querySelector('#takeover-status').textContent.includes('Waiting for the protected browser')), 'source failure has a non-blocking waiting state', 4000);
+      sourceFailure = false;
+      await until(() => page(() => document.querySelector('#takeover-status').textContent === ''), 'source mode recovers after backoff', 6500);
+      await click('#takeover-cancel');
       await click('#request-pages button','Next page');
       await click('#request-list button','Allow once');
-      await until(()=>page(()=>!document.querySelector('#takeover').hidden&&document.querySelector('#notice').textContent.includes('Waiting for the 1Password prompt')),'approved ceremony opens provider view while waiting');
+      await until(()=>page(()=>!document.querySelector('#takeover').hidden&&document.querySelector('#takeover-status').textContent.includes('Waiting for the 1Password prompt')),'approved ceremony opens provider view while waiting');
       assert.equal(await page(()=>document.querySelector('#takeover-title').textContent),'1Password on the executor');
       assert.equal(await page(()=>document.querySelector('#requests').hidden),true);
       assert.ok(calls.some(call=>call.operation==='request.status'),'provider-not-ready error checks request status');

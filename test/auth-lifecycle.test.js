@@ -9,6 +9,8 @@ const service = { id: 'example', origins: ['https://example.test'], startUrl: 'h
 function fakeBrowser(closed) {
   return { close: closed, connection: { on() {}, async send(method, args) {
     if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame', loaderId: 'loader', url: service.startUrl } } };
+    if (method === 'Page.getLayoutMetrics') return { cssVisualViewport: { clientWidth: 1, clientHeight: 1, pageX: 0, pageY: 0 } };
+    if (method === 'Page.captureScreenshot') return { data: 'AA==' };
     if (method === 'Target.createTarget') return { targetId: 'target' };
     if (method === 'Target.attachToTarget') return { sessionId: 'cdp' };
     if (method === 'Page.createIsolatedWorld') return { executionContextId: 1 };
@@ -64,6 +66,22 @@ test('partial executor construction closes created components', async () => {
     controller: { inspectSession() {}, withAuthenticationLease() {}, async close() { closed++; } },
     passkeyProvider: { async close() { passkeys++; } } }));
   assert.equal(closed, 1); assert.equal(passkeys, 1);
+});
+
+test('takeover observation slides its lease and closed sessions cannot retain takeovers', async () => {
+  const controller = createBrowserController({ profileRoot: '/tmp/chromesync-sliding-fixture', services: [service], launchBrowser: async () => fakeBrowser(async () => {}) });
+  try {
+    const session = await controller.openSession('example', 'agent');
+    const takeover = await controller.startTakeover(session.id, { timeoutMs: 180 });
+    await delay(90);
+    const view = await controller.takeoverObserve(takeover.takeoverId);
+    assert(view.expiresAt > takeover.expiresAt);
+    await delay(100);
+    assert.equal(controller.hasTakeover(takeover.takeoverId), true);
+    await controller.closeRequester('agent');
+    assert.equal(controller.hasSession(session.id), false);
+    assert.equal(controller.hasTakeover(takeover.takeoverId), false);
+  } finally { await controller.close(); }
 });
 
 test('failed startup cleanup retains its capacity reservation until close succeeds', async () => {

@@ -114,7 +114,7 @@ test('executor skips its own durable response blobs on subsequent polls and dele
   assert.equal(f.reads.includes(responseName), false);
 });
 
-test('read-only responses keep small durable replay markers and recheck live peer authorization on retry', async () => {
+test('ephemeral observations avoid durable replay markers and recheck live peer authorization on retry', async () => {
   const f = transportFixture();
   let calls = 0;
   const executor = createRelayExecutor({ identity: f.executorIdentity, getPeers: () => [f.peer], store: f.store, io: f.io, now: f.now,
@@ -123,7 +123,7 @@ test('read-only responses keep small durable replay markers and recheck live pee
   const command = f.enqueue('takeover.observe');
   await executor.poll(); await executor.drain();
   assert.equal(f.reply(command.id).result.observation, 1);
-  assert.ok(JSON.stringify(f.state.transport).length < 1000);
+  assert.equal(f.state.transport, undefined);
   f.blobs.set(command.name, command.blob);
   await executor.poll(); await executor.drain();
   assert.equal(f.reply(command.id).result.observation, 2);
@@ -230,4 +230,24 @@ test('stale sweep preserves future timestamps and counts rejected envelopes with
   assert.equal(result.rejectedEnvelopes, 1);
   assert(!f.blobs.has(old.name)); assert(f.blobs.has(future.name));
   assert(!JSON.stringify(result).includes('SECRET-SENTINEL'));
+});
+
+for (const operation of ['takeover.observe', 'passkey.observe']) test(`${operation} leaves encrypted journal state unchanged`, async () => {
+  const f = transportFixture('approver');
+  const before = JSON.stringify(f.state);
+  const command = f.enqueue(operation);
+  const executor = createRelayExecutor({ identity: f.executorIdentity, getPeers: async () => [f.peer], store: f.store, io: f.io, now: f.now, isReadOnly: () => true,
+    dispatch: async () => ({ format: 'jpeg', image: 'SYNTHETIC_FRAME' }) });
+  await executor.poll(); await executor.drain();
+  assert.equal(f.reply(command.id).result.image, 'SYNTHETIC_FRAME');
+  assert.equal(JSON.stringify(f.state), before);
+});
+
+test('oversized ephemeral response returns response-capacity instead of stranding the caller', async () => {
+  const f = transportFixture('approver'), command = f.enqueue('takeover.observe');
+  const executor = createRelayExecutor({ identity: f.executorIdentity, getPeers: async () => [f.peer], store: f.store, io: f.io, now: f.now, isReadOnly: () => true,
+    dispatch: async () => ({ image: 'x'.repeat(300000) }) });
+  await executor.poll(); await executor.drain();
+  assert.equal(f.reply(command.id).result.reason, 'response-capacity');
+  assert(!f.blobs.has(command.name));
 });
