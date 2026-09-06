@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import net from 'node:net';
+import { setTimeout as delay } from 'node:timers/promises';
 import { parseRelayUrl } from '../companion/relay-client.js';
 
 export const NAME = /^[a-z0-9][a-z0-9_-]{0,47}$/;
@@ -68,17 +69,36 @@ export function profilePaths(home, name) {
   return { dir, browser: path.join(dir, 'chrome'), state: path.join(dir, 'state.json'), lock: path.join(dir, 'sync.lock') };
 }
 
-// The OS owns this lock and releases it on crash, SIGKILL and reboot. It serves
-// no protocol/data. A hash collision or unrelated listener safely reports busy.
-export async function withLock(directory, scope, operation) {
+// The OS owns this lock and releases it on crash, SIGKILL and reboot. Preserve
+// the exact port mapping for exclusion with older releases. Brief contention
+// can come from another key's hash collision or an unrelated local socket;
+// retry only that same port, never the operation or a different lock address.
+export async function withLock(directory, scope, operation, { waitMs = 2000 } = {}) {
+  if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > 2000) throw new Error('Invalid lock wait');
   privateDir(directory);
   const key = fs.realpathSync(directory) + '/' + scope;
   const port = 20000 + crypto.createHash('sha256').update(key).digest().readUInt16BE(0) % 40000;
-  const server = net.createServer(socket => socket.destroy());
-  await new Promise((resolve, reject) => {
-    server.once('error', () => reject(new Error('Profile/configuration is busy; retry shortly (local lock port unavailable)')));
-    server.listen({ host: '127.0.0.1', port, exclusive: true }, resolve);
-  });
+  const deadline = performance.now() + waitMs;
+  let server;
+  for (;;) {
+    server = net.createServer(socket => socket.destroy());
+    try {
+      await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen({ host: '127.0.0.1', port, exclusive: true }, resolve);
+      });
+      break;
+    } catch (error) {
+      const remaining = deadline - performance.now();
+      if (error.code !== 'EADDRINUSE' || remaining <= 0) {
+        throw new Error('Profile/configuration is busy; retry shortly (local lock port unavailable)');
+      }
+      await delay(Math.min(25, remaining));
+      if (performance.now() >= deadline) {
+        throw new Error('Profile/configuration is busy; retry shortly (local lock port unavailable)');
+      }
+    }
+  }
   try { return await operation(); }
   finally { await new Promise(resolve => server.close(resolve)); }
 }
