@@ -20,3 +20,10 @@ test('headless approver list and decide use owner operations and selected factor
   assert.deepEqual(calls[1].slice(0, 2), ['request.decide', { requestId: 'synthetic', decision: 'once', factors: ['password', 'totp'] }]);
   assert.equal(lines.length, 2);
 });
+
+test('watch stops paging at the first recovery row', async () => {
+  const aborter = new AbortController(); let calls = 0, emitted = 0;
+  await runApproverCommand({ role: 'approver', async call() { calls++; return { items: [{ requestId: 'new', status: 'pending' }, { status: 'failed' }], hasMore: true, nextCursor: 'later' }; } }, 'approvals', { watch: true },
+    { signal: aborter.signal, output: () => emitted++, bell() {}, sleep: async () => aborter.abort() });
+  assert.equal(calls, 1); assert.equal(emitted, 1);
+});

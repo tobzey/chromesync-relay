@@ -6,11 +6,12 @@ export async function waitForAuth(remote, requestId, { timeoutSeconds = 300, now
   while (['pending', 'approved', 'authenticating'].includes(result?.status)) {
     const remaining = deadline - now();
     if (remaining <= 0) return { ...result, timedOut: true };
+    const hop = Math.max(1000, Math.min(60000, Math.trunc(remaining - 10000)));
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), remaining);
     let next;
     try {
-      next = await remote.call('auth.wait', { requestId, timeoutMs: Math.max(1000, Math.min(60000, Math.trunc(remaining))) }, { timeoutMs: Math.min(115000, Math.max(100, Math.trunc(remaining))), signal: controller.signal });
+      next = await remote.call('auth.wait', { requestId, timeoutMs: hop }, { timeoutMs: Math.min(115000, hop + 10000), signal: controller.signal });
     } finally { clearTimeout(timer); }
     if (next.status === 'uncertain') return controller.signal.aborted || now() >= deadline ? { ...result, timedOut: true } : next;
     result = next;

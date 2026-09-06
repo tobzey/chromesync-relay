@@ -21,7 +21,9 @@ export async function runApproverCommand(remote, command, values, { output = val
     do {
       const page = await call('requests', { cursor });
       if (!Array.isArray(page?.items)) break;
+      let reachedRecovery = false;
       for (const row of page.items) {
+        if (row.status !== 'pending') { reachedRecovery = true; break; }
         const requestId = row.requestId || row.id;
         if (row.status !== 'pending' || seen.has(requestId)) continue;
         seen.add(requestId);
@@ -29,7 +31,7 @@ export async function runApproverCommand(remote, command, values, { output = val
         output({ event: 'pending', requestId, name: row.name || row.serviceId, origin: row.origin, requesterId: row.requesterId, expiresAt: row.expiresAt });
         bell();
       }
-      cursor = page.hasMore ? page.nextCursor : null;
+      cursor = !reachedRecovery && page.hasMore ? page.nextCursor : null;
     } while (cursor && !signal?.aborted);
     try { await sleep(interval * 1000, undefined, { signal }); } catch (error) { if (error.name !== 'AbortError') throw error; }
   }

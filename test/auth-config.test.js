@@ -215,5 +215,5 @@ test('inbox persists its loopback port, reuses it and falls back only when a sav
   assert.equal(loadAuthConfig(home).inboxPort, Number(new URL(fallback.url).port));
   const override = await startConfiguredApprovalInbox({ ...options, port: 0 });
   t.after(() => override.close());
-  assert.equal(loadAuthConfig(home).inboxPort, Number(new URL(override.url).port));
+  assert.equal(loadAuthConfig(home).inboxPort, Number(new URL(fallback.url).port));
 });

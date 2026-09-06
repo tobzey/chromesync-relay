@@ -1,3 +1,4 @@
+import { diagnosticCode } from './diagnostic-codes.js';
 import { loadAuthConfig, saveInboxPort } from './config.js';
 import http from 'node:http';
 import crypto from 'node:crypto';
@@ -54,7 +55,7 @@ export async function startApprovalInbox({ call, port = 0, role = 'approver' }) 
       if (!OWNER_OPERATIONS.has(body.operation)) return send(res, 403, { error: 'Operation unavailable' });
       const result = await call(body.operation, body.args || {}, /^(takeover|passkey)\./.test(body.operation) ? { timeoutMs: 30000 } : {});
       return send(res, 200, { result });
-    } catch (error) { send(res, 400, { error: 'Operation failed. Check the executor connection and enrollment.', code: typeof error?.code === 'string' && /^[A-Z_]{1,40}$/.test(error.code) ? error.code : 'OPERATION_REJECTED' }); }
+    } catch (error) { send(res, 400, { error: 'Operation failed. Check the executor connection and enrollment.', code: diagnosticCode(error?.code) || 'OPERATION_REJECTED' }); }
   });
   server.requestTimeout = 100000;
   server.headersTimeout = 5000;
@@ -72,7 +73,7 @@ export async function startConfiguredApprovalInbox({ home, port, ...options }) {
     if (port !== undefined || !saved || error.code !== 'EADDRINUSE') throw error;
     inbox = await startApprovalInbox({ ...options, port: 0 }); portFallback = true;
   }
-  try { await saveInboxPort(home, Number(new URL(inbox.url).port)); }
+  try { if (port !== 0) await saveInboxPort(home, Number(new URL(inbox.url).port)); }
   catch (error) { await inbox.close(); throw error; }
   return { ...inbox, portFallback };
 }

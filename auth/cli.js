@@ -1,3 +1,4 @@
+import { diagnosticCode } from './diagnostic-codes.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { parseArgs } from 'node:util';
@@ -17,8 +18,8 @@ const HELP = `ChromeSync authentication — protected browser access and approva
   chromesync auth activate --activation-file ACTIVATION.json --fingerprint EXECUTOR_HEX
   chromesync auth identity
   chromesync auth passkey-setup --chrome /absolute/browser --origins https://service.example
-  chromesync auth executor [--port 0]           Run on the separate trusted host
-  chromesync auth approvals [--port 0]          Open the daily-driver approval inbox
+  chromesync auth executor [--port PORT]           Run on the separate trusted host
+  chromesync auth approvals [--port PORT]          Open the daily-driver approval inbox
   chromesync auth approvals --watch [--interval SECONDS]
   chromesync auth requests
   chromesync auth decide --request ID --decision once|always|deny [--factors password,totp]
@@ -43,6 +44,7 @@ const HELP = `ChromeSync authentication — protected browser access and approva
   chromesync auth handoff --session SESSION [--name PROFILE] [--headless]
   chromesync auth close --session SESSION
 
+The saved inbox port is reused. --port PORT saves an override; --port 0 is temporary.
 Pair agent and approval devices separately. Compare the displayed fingerprints
 through a trusted channel. The relay operator must admit each new room ID.
 Connect 1Password once through the trusted approval inbox. Search returns account
@@ -56,13 +58,14 @@ Verified installs and updates provision the executor SDK automatically.
 The executor must run outside the agent's OS and filesystem authority.
 `;
 
-export async function runAuthCli(argv = process.argv.slice(3)) {
-  try { return await run(argv); } catch (error) {
-    console.log(JSON.stringify({ status: 'failed', reason: typeof error?.code === 'string' && /^[A-Z_]{1,40}$/.test(error.code) ? error.code : 'OPERATION_REJECTED' }));
+export async function runAuthCli(argv = process.argv.slice(3), dependencies = {}) {
+  try { return await run(argv, dependencies); } catch (error) {
+    if (error?.operationRejected !== true) throw error;
+    console.log(JSON.stringify({ status: 'failed', reason: diagnosticCode(error.code) || 'OPERATION_REJECTED' }));
     process.exitCode = 1;
   }
 }
-async function run(argv) {
+async function run(argv, { remoteFactory = createAuthRemote, inboxFactory = startConfiguredApprovalInbox, sleep = delay } = {}) {
   const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: {
     role: { type: 'string' }, output: { type: 'string' }, relay: { type: 'string' }, fingerprint: { type: 'string' },
     'request-file': { type: 'string' }, 'activation-file': { type: 'string' }, port: { type: 'string' },
@@ -117,7 +120,7 @@ async function run(argv) {
     const controller = new AbortController();
     const stop = () => controller.abort();
     process.once('SIGINT', stop); process.once('SIGTERM', stop);
-    try { return await runApproverCommand(createAuthRemote(home), command, values, { output, signal: controller.signal }); }
+    try { return await runApproverCommand(remoteFactory(home), command, values, { output, signal: controller.signal }); }
     finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
   }
   if (command === 'executor' || command === 'approvals') {
@@ -133,11 +136,11 @@ async function run(argv) {
           if (command === 'executor') {
             executor = await createAuthExecutor({ home });
             const principal = publicIdentity(loadAuthSecrets(home).identity);
-            inbox = await startConfiguredApprovalInbox({ home, port, role: 'executor', call: (operation, args) => executor.dispatch(operation, args, principal) });
+            inbox = await inboxFactory({ home, port, role: 'executor', call: (operation, args) => executor.dispatch(operation, args, principal) });
           } else {
             if (loadAuthConfig(home).role !== 'approver') throw new Error('The approval inbox requires an approver identity');
-            const remote = createAuthRemote(home);
-            inbox = await startConfiguredApprovalInbox({ home, port, call: (operation, args, options) => remote.call(operation, args, options) });
+            const remote = remoteFactory(home);
+            inbox = await inboxFactory({ home, port, call: (operation, args, options) => remote.call(operation, args, options) });
           }
           writePrivate(path.join(home, 'inbox.json'), { pid: process.pid, url: inbox.url, role: command });
           output({ status: 'ready', role: command, approvalInbox: inbox.url, ...(inbox.portFallback ? { portFallback: true } : {}) });
@@ -152,7 +155,7 @@ async function run(argv) {
               }
             }
             const peerCount = executor ? loadAuthSecrets(home).peers.filter(peer => peer.enabled).length : 0;
-            await delay(Math.max(1000, peerCount * 100), undefined, { signal: controller.signal }).catch(error => { if (error.name !== 'AbortError') throw error; });
+            await sleep(Math.max(1000, peerCount * 100), undefined, { signal: controller.signal }).catch(error => { if (error.name !== 'AbortError') throw error; });
           }
         } finally {
           await inbox?.close(); await executor?.close();
@@ -162,7 +165,7 @@ async function run(argv) {
     } finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
     return;
   }
-  const remote = createAuthRemote(home);
+  const remote = remoteFactory(home);
   if (remote.role !== 'agent') throw new Error('Browser commands require an agent identity');
   if (command === 'wait') {
     const { waitForAuth } = await import('./wait-cli.js');

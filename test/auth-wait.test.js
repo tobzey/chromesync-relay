@@ -51,3 +51,12 @@ test('the CLI overall deadline returns the last state when a relay hop is still 
   const result = await waitForAuth(remote, 'synthetic', { timeoutSeconds: 0.03 });
   assert.deepEqual(result, { requestId: 'synthetic', status: 'pending', timedOut: true });
 });
+
+for (const [remaining, hop] of [[30000, 20000], [65000, 55000], [300000, 60000]]) test(`wait reserves transport margin with ${remaining}ms remaining`, async () => {
+  const remote = { async call(operation, args, options) {
+    if (operation === 'auth.status') return { status: 'pending' };
+    assert.equal(args.timeoutMs, hop); assert.equal(options.timeoutMs, hop + 10000);
+    return { status: 'succeeded' };
+  } };
+  await waitForAuth(remote, 'synthetic', { timeoutSeconds: remaining / 1000, now: () => 0 });
+});
