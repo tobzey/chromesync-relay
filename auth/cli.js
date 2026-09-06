@@ -22,19 +22,30 @@ const HELP = `ChromeSync authentication — protected browser access and approva
   chromesync auth inbox                         Show the running local inbox URL
   chromesync auth service install|uninstall     Manage the user background service
   chromesync auth services [--cursor CURSOR]    List a page of enrolled account aliases
-  chromesync auth open --service SERVICE
+  chromesync auth open --url URL [--method password|passkey]
+  chromesync auth search --session SESSION [--query NAME] [--cursor CURSOR]
+  chromesync auth search --url URL [--query NAME]
+  chromesync auth select --session SESSION --item ITEM_HANDLE
+  chromesync auth open --service SERVICE        Reuse an enrolled account
   chromesync auth observe --session SESSION
   chromesync auth navigate --session SESSION --url URL
   chromesync auth click --session SESSION --handle HANDLE
   chromesync auth type --session SESSION --handle HANDLE --text TEXT
-  chromesync auth request --session SESSION --service SERVICE --factors password,totp
+  chromesync auth request --session SESSION --revision REVISION [--factors password,totp]
+    [--username-handle HANDLE] [--password-handle HANDLE]
+    [--totp-handles HANDLE,HANDLE] [--submit-handle HANDLE]
   chromesync auth status --request REQUEST_ID
   chromesync auth cancel --request REQUEST_ID
+  chromesync auth handoff --session SESSION [--name PROFILE] [--headless]
   chromesync auth close --session SESSION
 
 Pair agent and approval devices separately. Compare the displayed fingerprints
 through a trusted channel. The relay operator must admit each new room ID.
-Connect 1Password and enroll services through the trusted approval inbox.
+Connect 1Password once through the trusted approval inbox. Search returns account
+names and website origins; selection still requires approval before credentials
+are used. Observe after selecting and pass its current revision to request.
+Handoff imports authenticated cookies directly into a local managed browser.
+Some sites require login on the protected host because their sessions cannot move.
 Never pass provider tokens, passwords or OTP values as command arguments.
 Install the executor SDK first: npm ci --prefix auth --ignore-scripts
 The executor must run outside the agent's OS and filesystem authority.
@@ -47,6 +58,10 @@ export async function runAuthCli(argv = process.argv.slice(3)) {
     service: { type: 'string' }, session: { type: 'string' }, request: { type: 'string' }, factors: { type: 'string' },
     url: { type: 'string' }, handle: { type: 'string' }, text: { type: 'string' }, json: { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
     chrome: { type: 'string' }, origins: { type: 'string' }, cursor: { type: 'string' },
+    query: { type: 'string' }, item: { type: 'string' }, method: { type: 'string' }, revision: { type: 'string' },
+    'username-handle': { type: 'string' }, 'password-handle': { type: 'string' },
+    'totp-handles': { type: 'string' }, 'submit-handle': { type: 'string' },
+    name: { type: 'string' }, headless: { type: 'boolean' },
   } });
   const command = positionals[0] || 'help';
   if (values.help || command === 'help') { console.log(HELP); return; }
@@ -121,14 +136,28 @@ export async function runAuthCli(argv = process.argv.slice(3)) {
   }
   const remote = createAuthRemote(home);
   if (remote.role !== 'agent') throw new Error('Browser commands require an agent identity');
+  if (command === 'handoff') {
+    const { importAuthenticatedSession } = await import('./session-handoff.js');
+    // Cookie values must never become CLI output or a temporary export file.
+    const bundle = await remote.call('browser.export', { sessionId: required('session') });
+    if (bundle?.version !== 1) throw new Error('Authenticated session export unavailable');
+    return output(await importAuthenticatedSession({ home, name: values.name, headless: values.headless, bundle }));
+  }
+  const bindings = Object.fromEntries([
+    ['username', values['username-handle']], ['password', values['password-handle']],
+    ['totp', values['totp-handles']?.split(',')], ['submit', values['submit-handle']],
+  ].filter(([, value]) => value !== undefined));
   const commands = {
     services: ['services', { cursor: values.cursor }],
-    open: ['browser.open', { serviceId: values.service }],
+    open: ['browser.open', { serviceId: values.service, url: values.url, method: values.method }],
+    search: ['accounts.search', { sessionId: values.session, url: values.url, query: values.query, cursor: values.cursor }],
+    select: ['accounts.select', { sessionId: values.session, itemHandle: values.item, method: values.method }],
     observe: ['browser.observe', { sessionId: values.session }],
     navigate: ['browser.navigate', { sessionId: values.session, url: values.url }],
     click: ['browser.click', { sessionId: values.session, handle: values.handle }],
     type: ['browser.type', { sessionId: values.session, handle: values.handle, text: values.text }],
-    request: ['auth.request', { sessionId: values.session, serviceId: values.service, factors: values.factors?.split(',') }],
+    request: ['auth.request', { sessionId: values.session, serviceId: values.service, factors: values.factors?.split(','),
+      revision: values.revision === undefined ? undefined : Number(values.revision), ...(Object.keys(bindings).length ? { bindings } : {}) }],
     status: ['auth.status', { requestId: values.request }],
     cancel: ['auth.cancel', { requestId: values.request }],
     close: ['browser.close', { sessionId: values.session }],

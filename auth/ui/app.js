@@ -39,6 +39,13 @@ function renderRequests(requests, hasMore) {
     const choice = preferences.get(requestId) || { factors: [...request.factors], days: 30 };
     preferences.set(requestId, choice);
     card.append(element('h2', request.name || request.serviceId), element('div', request.origin, 'origin'), element('p', `Account: ${request.accountId} · ${request.purpose}`, 'meta'), element('p', `Requested by ${request.requesterId}${request.status === 'pending' && request.expiresAt ? ` · Expires ${new Date(request.expiresAt).toLocaleTimeString()}` : ''}`, 'meta'));
+    if (request.catalog) {
+      card.append(element('p', `1Password entry: ${request.catalog.label}`, 'meta'),
+        element('p', `Saved websites: ${request.catalog.sourceOrigins?.length ? request.catalog.sourceOrigins.join(', ') : 'No website saved'}`, 'meta'));
+      if (request.catalog.originMatch !== true) card.append(element('p', 'This entry was selected by name. The requested website does not match its saved websites. Check the exact origin before allowing credentials.', 'deny'));
+      if (request.catalog.accountVerificationRequired) card.append(element('p', 'Verify the account shown by the sign-in provider before completing this request.'));
+    }
+    if (request.sessionHandoff) card.append(element('p', 'After sign-in, the authenticated session can be transferred to the requesting agent’s browser. The agent will be able to use this account’s session.'));
     if (request.status === 'needs-user') card.append(element('p', 'This authentication needs protected user interaction. A saved permission cannot complete it automatically.'));
     if (request.status === 'failed') card.append(element('p', 'Authentication did not complete. Review the service connection, then retry or complete it in the protected browser.'));
     if (['approved', 'authenticating'].includes(request.status)) card.append(element('p', 'Authentication is running. The agent is paused.'));
@@ -77,10 +84,17 @@ function renderPolicies(policies) {
     card.append(element('h3', policy.serviceId), element('div', policy.origin, 'origin'), element('p', `${policy.accountId} · ${(policy.factors || []).join(', ')} · ${(policy.purposes || []).join(', ')}`, 'meta'), element('p', policy.expiresAt == null ? 'Until revoked' : `Expires ${new Date(policy.expiresAt).toLocaleString()}`, 'meta'), action('Revoke', () => call('policy.revoke', { policyId: policy.id || policy.policyId }), 'deny')); list.append(card);
   }
 }
-function renderServices(services, peers) {
+function renderServices(services, peers, providers) {
   const list = $('#service-list'); list.replaceChildren();
-  if (!services.length) empty(list, 'Enroll your first service.', 'Connect a restricted 1Password vault, then add a tested sign-in flow.');
+  if (!services.length) empty(list, 'Accounts appear when an agent selects one.', 'Connect your vault above. Each new request comes here for approval; service configuration is optional.');
   for (const service of services) { const card = element('article', undefined, 'card'); card.append(element('h3', service.name || service.serviceId), element('p', `${service.accountId} · ${(service.factors || []).join(', ')}`, 'meta')); list.append(card); }
+  const connections = $('#provider-list'); connections.replaceChildren();
+  for (const provider of providers) {
+    const card = element('article', undefined, 'card');
+    card.append(element('h3', provider.id), element('p', provider.discoveryEnabled ? 'Agents can find accounts in this connected vault.' : 'Account discovery is disabled for this connection.'),
+      action(provider.discoveryEnabled ? 'Disable account discovery' : 'Enable account discovery', () => call('provider.discovery', { providerId: provider.id, enabled: !provider.discoveryEnabled })));
+    connections.append(card);
+  }
   const devices = $('#peer-list'); devices.replaceChildren();
   for (const peer of peers) { const card = element('article', undefined, 'card'); card.append(element('h3', peer.role), element('p', peer.id, 'meta')); if (peer.enabled) card.append(action('Revoke device', () => call('peer.revoke', { peerId: peer.id }), 'deny')); else card.append(element('span', 'Revoked', 'pill')); devices.append(card); }
 }
@@ -97,7 +111,8 @@ async function refresh() {
       renderPolicies(page.items); renderPages('policies', page, '#policy-pages');
     } else {
       const page = await call('enrollments', { cursor: pages.services.cursor });
-      renderServices(page.items, await call('peers')); renderPages('services', page, '#service-pages');
+      const [peers, providers] = await Promise.all([call('peers'), call('providers')]);
+      renderServices(page.items, peers, providers); renderPages('services', page, '#service-pages');
     }
     $('#connection').textContent = 'Executor connected';
   } catch (error) { $('#connection').textContent = 'Waiting for executor'; notice(error.message); }
@@ -152,9 +167,15 @@ async function beginReceiver(requestId) {
 }
 function showInteraction() {
   const receiver = activeTakeover.mode === 'receiver';
+  const adaptive = !receiver && activeTakeover.adaptive === true;
   $('#takeover-title').textContent = receiver ? '1Password on the executor' : 'Protected browser';
+  $('#takeover-instructions').textContent = adaptive
+    ? 'Only this approval device receives this view. Complete sign-in and check the account shown before handing the authenticated session to the agent. Click a field, then enter text below.'
+    : 'The agent is paused. Only this approval device receives this view. Click a field, then enter text below.';
   $('#receiver-target-label').hidden = !receiver; $('#takeover-clear-label').hidden = receiver;
-  $('#takeover-done').textContent = receiver ? 'Back to requests' : 'Verify and resume agent';
+  $('#takeover-confirm-label').hidden = !adaptive; $('#takeover-confirm').checked = false;
+  $('#takeover-done').textContent = receiver ? 'Back to requests' : adaptive ? 'Confirm account and hand off session' : 'Verify and resume agent';
+  $('#takeover-done').disabled = adaptive;
   $('#takeover-cancel').textContent = receiver ? 'Stop authentication' : 'Stop takeover';
   $('#takeover-image').removeAttribute('src'); $('#takeover-origin').textContent = '';
   document.querySelectorAll('.view').forEach(view => { view.hidden = true; });
@@ -187,16 +208,20 @@ $('#receiver-target').addEventListener('change', () => { if (activeTakeover?.mod
 $('#takeover-refresh').addEventListener('click', capture);
 function leaveInteraction() {
   activeTakeover = undefined; $('#takeover-image').removeAttribute('src'); $('#takeover-text').value = ''; $('#takeover').hidden = true;
+  $('#takeover-confirm').checked = false; $('#takeover-confirm-label').hidden = true;
   currentView = 'requests'; $('#requests').hidden = false; requestRenderKey = undefined;
 }
 async function finishTakeover(cancel) {
   if (!activeTakeover || captureBusy) return;
+  const adaptive = activeTakeover.mode === 'source' && activeTakeover.adaptive === true;
+  if (!cancel && adaptive && !$('#takeover-confirm').checked) { notice('Check the signed-in account, then confirm it before handing off the session.'); return; }
+  captureBusy = true;
   try {
     if (activeTakeover.mode === 'receiver') {
       if (cancel) await call('request.decide', { requestId: activeTakeover.requestId, decision: 'deny' });
       leaveInteraction(); await refresh(); return;
     }
-    const result = await call('takeover.finish', { takeoverId: activeTakeover.takeoverId, cancel });
+    const result = await call('takeover.finish', { takeoverId: activeTakeover.takeoverId, cancel, ...(!cancel && adaptive && $('#takeover-confirm').checked ? { confirmAuthenticated: true } : {}) });
     leaveInteraction();
     notice(result.status === 'authenticated' ? 'Authentication verified. The agent can continue.' : 'The browser remains protected because authentication was not verified.');
     await refresh();
@@ -204,14 +229,19 @@ async function finishTakeover(cancel) {
     if (cancel) {
       leaveInteraction(); notice('This view is closed. The executor has not confirmed that authentication stopped; check the request status.'); await refresh();
     } else notice(error.message);
-  }
+  } finally { captureBusy = false; }
 }
+$('#takeover-confirm').addEventListener('change', () => {
+  if (activeTakeover?.mode === 'source' && activeTakeover.adaptive === true) $('#takeover-done').disabled = !$('#takeover-confirm').checked;
+});
 $('#takeover-done').addEventListener('click', () => finishTakeover(false));
 $('#takeover-cancel').addEventListener('click', () => finishTakeover(true));
 $('#provider-form').addEventListener('submit', async event => {
   event.preventDefault(); const form = event.target; const token = form.elements.token;
-  try { await call('provider.put', { providerId: form.elements.providerId.value, token: token.value }); notice('1Password connection saved on the executor.'); }
-  catch (error) { notice(error.message); } finally { token.value = ''; }
+  const credential = token.value; token.value = '';
+  const button = form.querySelector('button[type="submit"]'); button.disabled = true;
+  try { await call('provider.put', { providerId: form.elements.providerId.value, token: credential, discoveryEnabled: form.elements.discoveryEnabled.checked }); notice('1Password connection saved on the executor.'); await refresh(); }
+  catch (error) { notice(error.message); } finally { token.value = ''; button.disabled = false; }
 });
 $('#enrollment-form').addEventListener('submit', async event => {
   event.preventDefault();

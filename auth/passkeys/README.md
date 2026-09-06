@@ -18,6 +18,8 @@ const controller = createBrowserController({
 });
 const providers = { onepassword, passkey: passkeys.provider };
 
+// After trusted catalog selection binds this discovery session to its account:
+await passkeys.rebindService(sessionId, selectedServiceId);
 // When a browser session closes:
 await passkeys.releaseSession(sessionId);
 // Before replacing an enrolled service:
@@ -28,6 +30,10 @@ await passkeys.close();
 
 The controller's trusted `prepareProfile({profilePath,session})` hook supplies `session.id`, `session.serviceId`, and its exact `session.origin`. It creates a sender extension bound to that session and starts a receiver bound to the same origin. The facade permits one live browser session per receiver profile; a concurrent session receives `needs-user`. Release the old session before opening another. The binding and sender artifacts remain valid for the browser's lifetime, so later reauthentication uses the same original session. Each ceremony and authorization retains its own timeout. Sender disconnect or explicit session/service release cleans up the receiver. A disconnected receiver is restarted before a subsequent approved attempt.
 
+Adaptive catalog browsing uses this same bridge without requiring a JSON enrollment for every service. When the agent opens a discovery session with method `passkey`, the trusted runtime calls `prepareProfile` with `catalogOrigin: true` and the validated public HTTPS origin. This permits provisioning for an origin outside the receiver configuration's initial `origins` list. Generated extension permissions, sender attribution and receiver navigation still name that one exact origin; the flag is a trusted constructor input, not an agent-supplied permission override. Missing or busy receiver setup fails the discovery launch rather than pretending a bridge was installed.
+
+After catalog selection, the runtime calls `rebindService(sessionId, selectedServiceId)` to associate the already prepared session with its stable account resource. It preserves the original session, origin and sender; it cannot rebind a different session or an active ceremony. Creating this binding does not authorize signing. The broker must approve the selected account, origin and factors before the provider function can forward an assertion.
+
 The provider implements `useFactors(enrollment, ['passkey'], sink, {signal})`. It supplies only a function to the controller:
 
 ```js
@@ -36,12 +42,12 @@ const signing = credentials.passkey({
   signal,
   assertCurrent, // throws if the controller's exclusive browser lease changed
 });
-// The controller can now click its enrolled passkey button.
+// The controller can now click the validated passkey button.
 await signing; // {completed:true, method:'passkey'}
-// The controller must still verify its enrolled RP success state.
+// The controller must still verify the RP account or require owner confirmation.
 ```
 
-The function waits for the original intercepted request; it never invents a challenge, credential ID, user identity, or assertion. Lease validation runs before forwarding to the receiver and again before delivering its result. The facade forwards the controller's final status; completion of a signature is not website login success.
+The function waits for the original intercepted request; it never invents a challenge, credential ID, user identity, or assertion. Lease validation runs before forwarding to the receiver and again before delivering its result. The facade forwards the controller's final status; completion of a signature is not website login success. Configured flows verify their enrolled `success.account`; adaptive mode requires an account identity signal or explicit owner confirmation after the challenge disappears. A catalog item describes the requested account but does not force the normal 1Password provider to select that account's credential. The owner must check the actual selected and signed-in account whenever automatic verification is unavailable.
 
 The `launchBrowser` constructor dependency exists for trusted tests/infrastructure. Never accept it, executable paths, profile paths, arbitrary WebAuthn options, extension paths, or native tokens from an agent-facing route.
 
@@ -66,11 +72,13 @@ await setup.close();
 
 `initializeManagedPasskeyReceiver()` performs the same configuration without opening a browser. It creates an empty `home/passkeys/receiver-profile` and a `.chromesync-managed-profile` marker. An existing populated unmarked directory is rejected; no ordinary browser profile is copied or enrolled automatically. The helper's browser launch also rejects ordinary personal Chrome/Chromium/Edge profile roots. `receiverProfile` may select another explicitly initialized dedicated path.
 
-The configuration in `home/passkeys/receiver.json` contains executable path, receiver path, provider type, and allowed origins; it contains no vault credentials. Restart the executor after setup or configuration changes. `provider:'browser'` selects another normal browser/platform credential provider and is also used by synthetic tests. With `provider:'onepassword'`, an installation-directory preflight returns `needs-user` if 1Password is absent; it does not claim the account is signed in or unlocked. Those checks remain with the actual provider operation.
+The configuration in `home/passkeys/receiver.json` contains executable path, receiver path, provider type, and initial allowed origins; it contains no vault credentials. Configured flows use that origin list. Trusted catalog provisioning can add the selected exact session origin as described above without broadening another session's permissions. Restart the executor after setup or configuration changes. `provider:'browser'` selects another normal browser/platform credential provider and is also used by synthetic tests. With `provider:'onepassword'`, an installation-directory preflight returns `needs-user` if 1Password is absent; it does not claim the account is signed in or unlocked. Those checks remain with the actual provider operation.
 
 Each service enrollment can set `passkey.receiverUrl` to a page at its `startUrl` origin. The runtime defaults this to `startUrl`, rather than the origin root, so a valid login path works even when `/` redirects to another host. `prepareProfile({profilePath,session,receiverUrl})` passes that trusted URL to the receiving extension. Direct low-level callers that omit it retain the origin-root default. Credentials in the URL and other origins are rejected. Keep only the intended service HTTP(S) tab in this dedicated profile; ambiguous page attribution remains a bounded failure. A service's passkey flow must match and invoke WebAuthn at the original `startUrl` origin; enrollment rejects other passkey origins.
 
-A broker's “always allow” rule can remove broker approval prompts. It cannot replace 1Password's own unlock, account selection, presence, or verification requirements. A dedicated receiver on an always-on trusted host removes the original daily driver's transport dependency, but **unattended 1Password passkey authentication is not established by this implementation**. The receiver must be enrolled and any normal provider interaction must be satisfied. No real 1Password account was enrolled in our tests.
+A broker's “always allow” rule can remove broker approval prompts. It cannot replace 1Password's own unlock, account selection, presence, or verification requirements. A dedicated receiver on an always-on trusted host removes the original daily driver's transport dependency, but **unattended or headless 1Password passkey authentication is not established by this implementation**. The receiver must be enrolled and any normal provider interaction must be satisfied. No real 1Password account was enrolled in our tests.
+
+After verified account login, the separate `auth handoff` command can transfer the resulting site cookies into the agent's local managed browser. It transfers neither passkey keys nor the dedicated receiver's 1Password enrollment. The local browser endpoint intentionally grants the agent that site's session authority; the assertion itself remains within the browser bridge. Cookie-only session portability, destination account verification and device binding require the [live acceptance checks](../../docs/authentication-acceptance.md).
 
 ## Owner interaction with the receiver
 

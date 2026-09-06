@@ -434,11 +434,19 @@ export function createBroker({ store, controller, providers, now = Date.now, exe
       });
     },
 
-    async listPendingPage(options = {}) {
+    async listPendingPage(options = {}, includeEnrollment = false) {
       await initialize();
       return store.mutate((state) => {
         expire(state, now());
-        return pageItems(state.requests.filter(needsAttention).map(pendingView), options, 'requests', (row) => row.requestId);
+        const items = state.requests.filter(needsAttention).map(row => {
+          const view = pendingView(row);
+          if (!includeEnrollment) return view;
+          const enrollment = state.enrollments.find(item => item.serviceId === row.serviceId);
+          return { ...view, name: enrollment?.name,
+            ...(enrollment?.catalog ? { catalog: enrollment.catalog, sessionHandoff: true } : {}) };
+        });
+        // Include owner-facing metadata before enforcing the encrypted page size.
+        return pageItems(items, options, 'requests', (row) => row.requestId);
       });
     },
 
@@ -693,7 +701,9 @@ export function createBroker({ store, controller, providers, now = Date.now, exe
         const previous = state.enrollments.find((item) => item.serviceId === enrollment.serviceId);
         if (previous && sameConfiguration(normalizeEnrollment(previous), enrollment)) return structuredClone(previous);
         const next = { ...enrollment, version: (previous?.version ?? 0) + 1, createdAt: previous?.createdAt ?? time, updatedAt: time };
-        if (!previous && state.enrollments.length >= 100) return { status: 'failed', reason: 'enrollment-capacity' };
+        // Catalog accounts are enrolled only when selected. Keep both a count
+        // ceiling and the shared byte budget; large custom flows hit bytes first.
+        if (!previous && state.enrollments.length >= 5000) return { status: 'failed', reason: 'enrollment-capacity' };
         const additionalBytes = Buffer.byteLength(JSON.stringify(next), 'utf8') - (previous ? Buffer.byteLength(JSON.stringify(previous), 'utf8') : 0);
         if (additionalBytes > 0 && !admitAuthGrowth(state, additionalBytes + 2048, time)) return { status: 'failed', reason: 'storage-capacity' };
         state.enrollments = state.enrollments.filter((item) => item.serviceId !== enrollment.serviceId);

@@ -1,4 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
+import { createOnePasswordCatalog } from './onepassword-catalog.js';
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const STATUSES = new Set(['authenticated', 'needs-user', 'failed']);
@@ -40,10 +41,18 @@ export function createOnePasswordProvider({ loadToken, loadSdk = () => import('@
         return sdk.createClient({ auth: token, integrationName: 'ChromeSync authentication executor', integrationVersion: '0.1.0' });
       })());
     }
-    return clients.get(providerId);
+    const pending = clients.get(providerId);
+    try { return await pending; }
+    catch (error) {
+      if (clients.get(providerId) === pending) clients.delete(providerId);
+      throw error;
+    }
   }
+  const catalog = createOnePasswordCatalog({ client, now });
   return Object.freeze({
-    reset(providerId) { clients.delete(providerId); },
+    reset(providerId) { clients.delete(providerId); catalog.reset(providerId); },
+    searchAccounts: catalog.searchAccounts,
+    resolveAccount: catalog.resolveAccount,
     async useFactors(enrollment, factors, consume, { signal } = {}) {
       let credentials = {}, active = true;
       const providerId = enrollment.providerId || 'default';

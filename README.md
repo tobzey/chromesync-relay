@@ -94,18 +94,35 @@ threat boundaries. There has not been an independent cryptographic audit.
 
 ## Authentication requests
 
-The new `chromesync auth` commands run protected browser sessions on a separate
-trusted executor. Agents request authentication; a daily-driver inbox can deny,
-allow once, or save account/origin/factor permissions. A scoped 1Password service
-account supplies passwords and TOTP without contacting the daily driver when a
-saved rule applies. The agent receives neither credential values nor a debugging
-endpoint.
+The `chromesync auth` commands run sign-in in a protected browser on a separate
+trusted executor. Connect a restricted 1Password service account once in the
+daily-driver inbox. Agents can search account names and website origins, select
+an account, and request approval without a JSON configuration for each service.
+The inbox can deny, allow once, or save account/origin/factor permissions. A
+scoped service account supplies passwords and TOTP while the daily driver is
+offline when a saved rule applies and the site can complete sign-in automatically.
+
+Agents navigate through sanitized observations and select credential controls
+by opaque handles; credential values stay on the executor. Ambiguous forms or
+unverified account identity require the owner to finish in the protected view.
+Tested, configured sign-in and reauthentication flows remain an optional advanced
+setup.
+
+After authentication, `chromesync auth handoff --session SESSION` imports that
+account's cookies directly into a dedicated local agent browser. It prints the
+local profile and debugging endpoint, never the cookie bundle or 1Password
+values. The agent deliberately receives the authenticated session's authority;
+the protected executor's debugging connection stays private. Handoff is a
+one-time cookie transfer: local storage, IndexedDB and device-bound sessions
+are not portable through it, so verify login in the receiving browser.
 
 Existing passkeys use a dedicated normal 1Password receiver and a browser-level
 WebAuthn bridge. Synthetic real-browser tests pass; live 1Password enrollment and
 service compatibility still require validation. Provider unlock and verification
-requirements remain in force. See [authentication setup](docs/authentication.md)
-for roles, enrollment, commands, current support and acceptance gates.
+requirements remain in force; unattended or headless 1Password passkeys are not
+established. See [authentication setup](docs/authentication.md) for roles and
+commands, and [live acceptance](docs/authentication-acceptance.md) for the checks
+required before relying on a real service.
 
 ## Development
 

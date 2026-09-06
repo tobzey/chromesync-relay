@@ -22,7 +22,7 @@ export function inspectPage(flows) {
   } catch { return {error:'INVALID_SELECTOR'}; }
 }
 
-export function observePage(stateKey, credentialSelectors, limit) {
+export function observePage(stateKey, credentialSelectors, limit, adaptive = false) {
   const state = {nodes:new Map()};
   globalThis[stateKey] = state;
   const visible = el => el.isConnected && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
@@ -53,6 +53,24 @@ export function observePage(stateKey, credentialSelectors, limit) {
         label, credential, editable:!credential && el.matches('input:not([type="hidden"]),textarea') && !el.disabled && !el.readOnly,
         disabled:!!el.disabled};
       if (handle) item.handle = handle;
+      if (adaptive && interactive) {
+        const type=(el.getAttribute('type')||'text').toLowerCase();
+        const autocomplete=(el.getAttribute('autocomplete')||'').toLowerCase();
+        const hints=`${autocomplete} ${el.name||''} ${el.id||''} ${el.getAttribute('aria-label')||''} ${Array.from(el.labels||[]).map(label=>label.textContent).join(' ')}`.toLowerCase();
+        item.inputKind=['text','email','password','tel','number','submit','button'].includes(type)?type:'other';
+        item.autocomplete=['username','email','current-password','new-password','one-time-code'].includes(autocomplete)?autocomplete:'unspecified';
+        item.inputRole=autocomplete==='new-password' || /confirm.?password|new.?password/.test(hints)?'new-password':
+          type==='password'?'current-password':/one.?time|otp|totp|2fa|verification.?code|security.?code/.test(hints)?'one-time-code':
+          type==='email' || /username|user.?name|email|e-mail|login.?id/.test(hints)?'username':'unknown';
+        if (el.form) {
+          let formHandle=state.forms?.get(el.form);
+          if (!formHandle) {state.forms??=new Map();formHandle=crypto.randomUUID();state.forms.set(el.form,formHandle);}
+          item.formHandle=formHandle;
+        }
+        if (['username','current-password','one-time-code','new-password'].includes(item.inputRole)) {
+          item.credential=true;item.editable=false;item.label='Credential field';
+        }
+      }
       // No input values, DOM attributes, raw hrefs, HTML, cookies or screenshots.
       elements.push(item);
     }

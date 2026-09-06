@@ -1,6 +1,8 @@
 # Agent authentication and approvals
 
-ChromeSync authentication uses a separate trusted executor. It owns the browser, credentials and policy store. Agents send signed, encrypted commands through the relay and receive constrained browser observations and fixed authentication outcomes. The daily driver runs an approval inbox; an existing persistent rule does not contact it.
+Connect a scoped 1Password vault once, then let an agent search for an account by website and item name. The agent selects an opaque account handle, identifies the login controls, and requests permission. A separate trusted executor fills credentials in an isolated browser; after verified login, the agent can import that session's cookies into its own managed browser. Ordinary login does not require a JSON adapter for each account.
+
+The executor owns the protected browser, provider credentials and policy store. Signed, encrypted commands pass through the relay. The daily driver supplies decisions through its approval inbox; a matching persistent permission can run without contacting it. Some websites still require owner verification or a tested custom flow.
 
 The implementation includes encrypted approvals, a protected browser, password/TOTP delivery through the public SDK, and a normal-provider passkey bridge. Synthetic accounts pass the complete local integration suite in current Chrome for Testing. Real 1Password vault enrollment and service compatibility remain separate acceptance gates; a synthetic authenticator is not a verified 1Password deployment. Follow the [live acceptance runbook](authentication-acceptance.md) before relying on it for an account.
 
@@ -9,11 +11,11 @@ The implementation includes encrypted approvals, a protected browser, password/T
 | Device | Authority |
 | --- | --- |
 | Executor | Protected Chrome processes, scoped 1Password integration, encrypted request/policy store. |
-| Agent | Its own identity and relay channel; enrolled account aliases, browser operations and authentication request/status/cancel. |
+| Agent | Its own identity and relay channel; disclosed account titles/origins, constrained login controls, requests, and approved session handoff. |
 | Approver | Separate identity for request decisions, persistent permissions and trusted enrollment. |
 | Relay | Opaque encrypted envelopes and channel admission. It has no vault decryption key or authority to approve. |
 
-Use a separate Mac or Linux host for the executor, outside the browsing agent's shell, filesystem and process authority. A second process under an unrestricted agent's own account does not meet the isolation requirement. Existing `chromesync endpoint` cookie-sync profiles remain raw-CDP sessions; use `chromesync auth` for protected sessions. There is no automatic migration of an arbitrary agent-modified profile into protected mode.
+Use a separate Mac or Linux host for the executor, outside the browsing agent's shell, filesystem and process authority. A second process under an unrestricted agent's own account does not meet the isolation requirement. Existing `chromesync endpoint` cookie-sync profiles remain raw-CDP sessions; use `chromesync auth` for protected sessions. Discovery starts a fresh protected profile. Handoff sends authenticated cookies to a separate agent-owned profile; it does not import an arbitrary agent-modified browser into the trusted executor.
 
 The approval inbox also requires a trusted environment. Its loopback listener trusts local clients: Host/Origin checks and CSRF protection do not authenticate a shell process on that machine. Separate ChromeSync directories or ordinary OS users alone do not isolate this listener. If agents run on the approval computer, confine them to a VM or sandbox that cannot reach the host's loopback inbox, Keychain, approval files, browser/desktop controls or administrative interfaces. Until that separation is established, use the executor's local trusted inbox or another trusted approval device.
 
@@ -24,7 +26,8 @@ flowchart LR
     R <--> E[Trusted executor: policy and browser]
     E --> P[1Password API: password and TOTP]
     E --> K[Dedicated 1Password receiver: passkeys]
-    E --> S[Enrolled website]
+    E --> S[Selected website]
+    E -->|Verified cookies through encrypted channel| B[Agent-owned session browser]
 ```
 
 Install Node 22+, Chrome and the OS credential-store requirements from [installation](install.md). Install the pinned executor dependency from the repository root:
@@ -74,43 +77,71 @@ On the executor, run `chromesync auth executor`. On the daily driver, run `chrom
 
 The executor also offers a local inbox for initial setup. Keep this UI on a trusted host; do not expose its port through a public reverse proxy. Remote approval uses the enrolled approval identity through the encrypted relay.
 
-Use `chromesync auth service install` on an initialized executor or approval device to run its role as a macOS/Linux user service. `chromesync auth inbox` shows its running local URL. `chromesync auth service uninstall` stops and removes only that authentication service. See [background service behavior](../auth/README.md). The OS credential store must be available to the user service; a locked keyring cannot supply unattended credentials.
+Use `chromesync auth service install` on an initialized executor or approval device to run its role as a macOS/Linux user service. After the service has started, `chromesync auth inbox` shows its local URL. Startup is asynchronous; if the inbox record is not ready, retry briefly and inspect the foreground command if it remains unavailable. `chromesync auth service uninstall` stops and removes only that authentication service. See [background service behavior](../auth/README.md). The OS credential store must be available to the user service; a locked keyring cannot supply unattended credentials.
 
 Interactive authentication requires relay budgets above the existing cookie-snapshot defaults. A dedicated authentication deployment can start with `RATE_IP_CAPACITY=120`, `RATE_IP_REFILL=20`, `RATE_ROOM_CAPACITY=120`, and `RATE_ROOM_REFILL=10`, while retaining room admission, size limits, quotas and expiry. Tune for the number of devices and expected browser operations. The client backs off on rate limits; executor polling is bounded by peer count. This version uses polling, so it is not instant push delivery.
 
-## Enroll passwords and TOTP
+## Connect a vault once
 
-1. Create a custom 1Password vault containing only the accounts you want to enroll. Provision a read-only service account for that vault. Personal/default vault restrictions are documented by [1Password](https://www.1password.dev/service-accounts/get-started).
-2. Open **Services & devices → Connect a 1Password service account** in the trusted inbox. Enter the token there. Never paste it into an agent conversation or shell argument. It is sent encrypted to the executor and saved in its OS credential store.
-3. Add a service configuration. Use the example in the inbox as a starting point; replace its origins, item/field IDs and form selectors with tested values. Account names are aliases shown to the agent, not vault enumeration.
+1. Create a custom 1Password vault containing only accounts available to this integration. Give a service account read-only access to that vault. Service accounts cannot access the built-in Personal, Private, Employee or default Shared vaults; the vault restriction is enforced by 1Password. See [service account setup](https://www.1password.dev/service-accounts/get-started).
+2. Open **Vault & devices** in the trusted inbox and connect the service account. Enter the token only in that owner UI. It travels encrypted to the executor and is saved in its OS credential store. Never paste it into an agent conversation or command argument.
+3. Enable account discovery for the connection. Agents can now search accounts by exact website origin and optional item name. There is no per-account JSON setup for a standard login. Use distinct item titles when you have several accounts at the same site; usernames are not exposed by search.
 
-The provider resolves exact enrolled fields. An OTP reference requests the generated code using `?attribute=otp`; it does not fetch a whole item or the seed. TOTP is requested at its actual form step, with a rollover margin. Set `totpPeriodSeconds` if the enrolled service uses a period other than 30 seconds. Clock health remains an operator dependency.
+Search reads item overviews and returns only bounded titles, website origins, exact-origin/name match reasons and temporary opaque handles. It does not return usernames, passwords, TOTP seeds or codes. The executor builds this metadata index on demand, caches it for five minutes, and returns at most 20 results per page. A synthetic 3,000-item catalog is tested; the index has a 20,000-item cap. This uses the SDK's [vault and item listing API](https://www.1password.dev/sdks/list-vaults-items). Account titles are deliberately disclosed metadata, so do not put secrets in them.
 
-Form automation is explicit: each flow has a purpose (`login` or `reauthentication`), a visible challenge selector, bounded fill/click/wait steps and an exact success condition. Origin checks apply at each step. Separate IdP, API and resource origins must be enrolled deliberately; unapproved network destinations and subframe documents are blocked. A successful credential lookup is not treated as successful authentication.
+Selecting a password account privately calls the SDK's `items.get` to infer the username, password and optional TOTP field references. **That selected-item read includes its values inside the trusted SDK/executor before fill approval.** Values are neither returned to the agent nor retained in the catalog. Approval gates credential use in the browser, rather than this private schema read. See the SDK's [item retrieval API](https://www.1password.dev/sdks/manage-items). Factors are reported after this selected-account schema inspection. Ambiguous or unsupported item fields require owner review.
 
-Success must verify the expected account as well as a signed-in page. Every flow requires `success.account`, for example `{ "selector": "[data-account-id]", "attribute": "data-account-id", "value": "EXPECTED_ACCOUNT_ID" }`. Without `attribute`, the executor compares the selected element's trimmed visible text exactly. Select one visible, stable identity marker supplied by the service; a generic “logged in” heading is insufficient. The expected identity is private configuration and is redacted from agent observations. Wrong-account selection stays unresolved, including during passkey use and owner takeover.
+Selection binds that fresh browser to one account and creates its internal enrollment; it grants no permission. Account handles are short-lived and bound to the requesting agent and exact origin. Selecting another account requires a fresh discovery browser. The provider retrieves approved fields again for the actual fill. A TOTP code is resolved at its form step, with a rollover margin; the seed never reaches the agent. Clock health and [1Password service account quotas](https://www.1password.dev/service-accounts/rate-limits) remain deployment dependencies.
+
+Disabling discovery on a connection stops new searches and selections. Revoke existing permissions or devices separately to stop already enrolled access.
 
 ## Agent workflow
 
 ```sh
-chromesync auth services
-chromesync auth open --service acme-work
+chromesync auth open --url https://service.example/login
+chromesync auth search --session SESSION_ID --query 'Work account'
+chromesync auth select --session SESSION_ID --item ITEM_HANDLE
 chromesync auth observe --session SESSION_ID
-chromesync auth request --session SESSION_ID --service acme-work --factors password,totp
+chromesync auth request --session SESSION_ID --revision REVISION --factors password,totp
 chromesync auth status --request REQUEST_ID
+# Only after status is succeeded:
+chromesync auth handoff --session SESSION_ID --name service-work --headless
+chromesync auth close --session SESSION_ID
 ```
 
-`services` returns `{items,nextCursor,hasMore}`. Pass `--cursor` to retrieve another page. Owner request, permission and enrollment lists use the same bounded pagination. Requests covered by approval return `approved` promptly; poll `status` through `approved`/`authenticating` until a final outcome before continuing browser actions.
+Use the values returned by each command. `search --url https://service.example/login --query 'Work account'` can inspect metadata before opening a browser. `search` and `services` return `{items,nextCursor,hasMore}`; use `--cursor` for the next page. `open --service SERVICE_ID` reuses an already selected enrollment. Observe again after selection because it changes the session revision.
 
-Normal interaction uses `navigate`, `observe`, `click` and `type`. Observations return opaque control handles. Credential fields cannot be typed by agents, and no evaluation, raw DOM, cookies, network bodies, profile paths or CDP endpoint is exposed. During authentication all agent observation/control is blocked. Failed or uncertain fills quarantine the session until verified recovery or closure.
+Observation gives opaque control handles and safe input roles, never input values. Standard username, password and single/split TOTP forms can be recognized privately. To choose among visible controls, supply observed handles:
 
-The agent supplies a session handle and account alias. The executor derives the actual browser origin, challenge and purpose. It never trusts an agent's claim that a request is merely routine sign-in.
+```sh
+chromesync auth request --session SESSION_ID --revision REVISION \
+  --factors password,totp --username-handle USERNAME_HANDLE \
+  --password-handle PASSWORD_HANDLE --submit-handle SUBMIT_HANDLE
+```
 
-For SMS, unknown forms or other manual steps, the owner can choose **Complete in protected browser**. A private viewport with click/type/keyboard controls is delivered only to that authenticated approval device while the agent is paused. **Verify and resume agent** requires an enrolled success and account marker and no remaining challenge. Failure, expiry or stopping takeover leaves the session quarantined. The same approver can reopen a live takeover after reloading its inbox. Native OS dialogs require access to the actual trusted device.
+Include only fields currently present; a username-only first page does not need a password handle. For a split code, `--totp-handles HANDLE1,HANDLE2,HANDLE3,HANDLE4,HANDLE5,HANDLE6` preserves digit order. Handles must still refer to the same live controls and form. The executor follows subsequent standard steps privately, up to eight steps within 120 seconds. Changed controls, ambiguous forms, password-change fields and credential submissions to another origin are rejected. Adaptive pages may load public HTTPS subresources; top-level navigation remains at the selected exact origin and subframe documents are blocked. A separate identity provider therefore needs its own login-origin session or an advanced owner-configured flow.
 
-For failed or unresolved requests, **Review and retry** re-inspects the browser and creates a new request that requires a fresh decision, including when a saved permission exists. An already authenticated browser is verified without repeating the ceremony. A changed enrollment or unknown challenge cannot reuse the old approval. Denial can also interrupt an active ceremony; it cannot undo a submission already accepted by the website.
+Requests covered by a decision return `approved` promptly. Poll `status` through `approved`/`authenticating` until the final outcome before continuing. Normal protected interaction uses `navigate`, `observe`, `click` and `type`; agents cannot type credential fields or use evaluation, raw DOM, network bodies, profile paths or CDP. Every agent observation and control channel pauses during authentication. Failed or uncertain fills quarantine the session until recovery or closure.
 
-Outcomes include `pending`, `approved`, `authenticating`, `succeeded`, `needs-user`, `denied`, `cancelled`, `expired` and `failed`. A transport timeout returns `uncertain` with a command ID: it does not prove the browser action never ran. Do not blindly repeat a sensitive click or submission after an uncertain result. Durable command records prevent delivery retries from re-executing a committed mutation; interrupted commands require state inspection.
+Successful credential submission alone does not prove the selected account is signed in. Adaptive verification requires the private username to match an exact visible account indicator outside the form, or an owner-configured verification rule. Generic welcome pages and redirects return `needs-user` with `VERIFICATION_REQUIRED`. For those sites, the owner uses **Complete in protected browser**, checks the account, and explicitly confirms the authenticated state. That confirmation applies only to the current session/document; it does not silently learn a persistent verification rule. A new login challenge invalidates it, including inside a single-page app.
+
+The same protected owner view handles SMS or unfamiliar forms. Only the acting approver receives its viewport and click/type/keyboard controls while the agent is paused. An unfinished challenge, cancellation or timeout leaves the session quarantined. Native OS dialogs require access to the actual trusted device. Advanced configured flows still require their declared account marker before resuming.
+
+For failed or unresolved requests, **Review and retry** re-inspects the browser and requires a fresh decision, including when a saved permission exists. An already authenticated browser can be verified without repeating the ceremony. Denial can interrupt an active ceremony but cannot undo a submission already accepted by the website.
+
+Outcomes include `pending`, `approved`, `authenticating`, `succeeded`, `needs-user`, `denied`, `cancelled`, `expired` and `failed`. A transport timeout returns `uncertain` with a command ID; it does not prove the action never ran. Inspect state before repeating a sensitive click. Durable command records prevent delivery retries from re-executing committed mutations.
+
+## Session handoff
+
+`auth handoff` transfers cookies through the encrypted channel directly into a local managed browser. Cookie values are not printed as CLI JSON or written to an export file. The destination profile is pinned to the selected account and exact origin; reusing a profile for another account is rejected. It becomes an ordinary agent-owned browser, so the agent receives the resulting website session authority.
+
+Export requires a verified, current protected session with no active lease. It includes at most 200 cookies for the current exact hostname (or its matching domain-cookie form), within 80 KiB. The URL includes only origin and path. Credential echoes, a changed browser document or changed verification state abort the export. Cookies for parent domains, sibling hosts, unrelated services, local storage and IndexedDB are not transferred. Device-bound sessions and sites needing omitted state may require continued work in the protected browser; cookie import is not proof that every site will accept a migrated session. Closing the protected session does not revoke a session already imported into the agent browser.
+
+## Advanced configured flows
+
+Owner-authored service JSON remains supported for nonstandard sites and explicit `login`/`reauthentication` purposes. The inbox example supplies the schema: exact origins, item/field IDs, a challenge selector, bounded fill/click/wait steps and a success condition. Enroll any additional IdP, API or resource origins deliberately; configured flows do not inherit adaptive public-subresource access.
+
+Every configured flow requires `success.account`, for example `{ "selector": "[data-account-id]", "attribute": "data-account-id", "value": "EXPECTED_ACCOUNT_ID" }`. Without `attribute`, the selected element's trimmed visible text must match exactly. The expected identity is private and redacted from agent observations. A generic signed-in heading is insufficient. An adaptive enrollment may instead retain an owner-provided `authentication.verification` rule with the same selector/value/optional data-attribute shape. Agent input cannot set expected identity or trusted verification rules.
 
 ## Decisions and persistent permission
 
@@ -118,11 +149,11 @@ The inbox shows the service origin, account, requester, requested factors and pu
 
 Persistent permissions bind account, requester, exact origin, enrollment revision, factors and purpose. Changing enrollment invalidates old permissions. Routine login permission does not automatically authorize sensitive reauthentication. Revoking an active permission aborts further form operations; it cannot undo a submission the website already accepted.
 
-An executor restart marks interrupted authentication uncertain. There is no automatic retry of an ambiguous sensitive action. Deny/cancel/expiry and provider failures do not produce success. The approved ceremony has a maximum 120-second execution window; password flows default to 30 seconds and passkey flows to 120 seconds. A website may grant a whole session a temporary privileged window; an authentication decision alone is not a guarantee that only one subsequent transaction can occur.
+An executor restart marks interrupted authentication uncertain. There is no automatic retry of an ambiguous sensitive action. Deny/cancel/expiry and provider failures do not produce success. The approved ceremony has a maximum 120-second execution window. Adaptive and passkey flows default to 120 seconds; advanced password flows default to 30 seconds. A website may grant a whole session a temporary privileged window; an authentication decision alone is not a guarantee that only one subsequent transaction can occur.
 
 Ordinary terminal request results are retained for 30 days. At the 5,000-request count limit or under storage pressure, the oldest eligible terminal results and inactive policies may rotate after a minimum 15-minute replay window. Open requests and outcomes marked `authentication-uncertain` are not silently removed. A rotated request returns `not-found`; this is not evidence that its action never occurred.
 
-Resource admission is bounded: eight browsers globally/four per requester by default, 100 open requests per requester/1,000 globally, 100 enrollments, 1,000 active policies and 128 paired device records. Each enrollment is at most 64 KiB; lists use pages of 20 by default, at most 50 and 96 KiB. Persistent growth stops at 4 MiB beneath an 8 MiB snapshot ceiling, reserving room for completion and cleanup. The audit tail is bounded to 2,000 entries/256 KiB; command history has separate limits and reserved owner cleanup capacity. Capacity failures are explicit, and owner reads, denial and revocation remain available for supported states. An oversized externally modified store is not automatically repaired by deleting unresolved authority.
+Resource admission is bounded: eight browsers globally/four per requester by default, 100 open requests per requester/1,000 globally, 5,000 used account enrollments, 1,000 active policies and 128 paired device records. Each enrollment is at most 64 KiB; lists use pages of 20 by default, at most 50 and 96 KiB. The shared persistent store stops admitting growth at 4 MiB beneath an 8 MiB snapshot ceiling, reserving room for completion and cleanup. This byte cap can be reached before all 5,000 enrollment slots are used. The audit tail is bounded to 2,000 entries/256 KiB; command history has separate limits and reserved owner cleanup capacity. Capacity failures are explicit, and owner reads, denial and revocation remain available for supported states. An oversized externally modified store is not automatically repaired by deleting unresolved authority.
 
 ## Existing 1Password passkeys
 
@@ -134,11 +165,13 @@ chromesync auth passkey-setup \
   --origins https://service.example
 ```
 
-This opens a new, marked receiver profile. Install the official 1Password extension there and sign in with a member/guest identity restricted to the enrolled vault. Do not sign in to the owner's entire account and rely on a vault-visibility filter for access control. Finish setup before starting the executor.
+This opens a new, marked receiver profile. Install the official 1Password extension there and sign in with a member/guest identity restricted to the enrolled vault. Do not sign in to the owner's entire account and rely on a vault-visibility filter for access control. Finish setup before starting the executor. The setup origin list scopes advanced services; a catalog discovery session binds its receiver to the actual selected HTTPS origin and still requires the corresponding account approval.
 
-A passkey service uses `provider: "passkey"`, `factors: ["passkey"]` and a flow step such as `{ "type": "passkey", "selector": "#use-passkey" }`, followed by a verified success condition. The sender proxy preserves the original request; the receiver calls normal WebAuthn at the genuine origin and allows the unchanged provider to perform its ceremony. No passkey private key crosses the relay or reaches the agent.
+For discovery, open with `auth open --url https://service.example/login --method passkey`, search/select the item, then observe and request with `--factors passkey`; pass its button handle as `--submit-handle` if needed. The receiver starts at the discovery login URL. Catalog selection identifies an intended account from metadata; it cannot constrain which passkey the normal provider selects. Without a private account-verification rule, the owner must inspect and confirm the original authenticated account before session handoff.
 
-The receiver opens the enrolled `startUrl` by default. Set `passkey: { "receiverUrl": "https://accounts.example.com/login" }` when it needs another page at that same exact origin, such as when `/` redirects elsewhere. This URL comes only from owner enrollment. Passkey flows must match and invoke WebAuthn at the `startUrl` origin; an incompatible origin is rejected during enrollment. For an identity provider, enroll its login URL as `startUrl` and list the application's separate return origin when needed.
+An advanced JSON service uses `provider: "passkey"`, `factors: ["passkey"]` and a flow step such as `{ "type": "passkey", "selector": "#use-passkey" }`, followed by its exact account verification. The sender proxy preserves the original request; the receiver calls normal WebAuthn at the genuine origin and allows the unchanged provider to perform its ceremony. No passkey private key crosses the relay or reaches the agent.
+
+For an advanced service, the receiver opens its enrolled `startUrl` by default. Set `passkey: { "receiverUrl": "https://accounts.example.com/login" }` when it needs another page at that same exact origin, such as when `/` redirects elsewhere. This URL comes only from owner enrollment. Passkey flows must match and invoke WebAuthn at the `startUrl` origin; an incompatible origin is rejected during enrollment. For an identity provider, enroll its login URL as `startUrl` and list the application's separate return origin when needed.
 
 The first implementation supports top-level same-origin ceremonies and one active receiving profile at a time. Unvalidated WebAuthn extensions, conditional mediation and cross-origin frames are rejected. Provider unlock/selection and user verification may still require interaction. Missing receiver enrollment returns `needs-user`; a broker policy never invents a biometric verification. See [passkey integration](../auth/passkeys/README.md) for exact tests and limitations.
 
@@ -146,7 +179,7 @@ After passkey approval, the inbox opens **1Password on the executor**. It can sh
 
 ## Offline behavior and phone approvals
 
-With a valid persistent rule, an online executor can use the service-account API while the daily driver is off. The executor still needs its own unlocked credential store and provider connectivity. Public SDK access to existing passkeys is unavailable; the independently enrolled normal provider is the passkey path. Unattended provider lock/restart behavior needs live validation.
+With a valid persistent rule, an online executor can use the service-account API for password/TOTP while the daily driver is off, provided that site's flow and account verification can finish automatically. A site requiring fresh owner confirmation cannot complete unattended merely because its password is always allowed. The executor still needs its own unlocked credential store and provider connectivity. Public SDK access to existing passkeys is unavailable; the independently enrolled normal provider is the passkey path. Unattended provider lock/restart behavior needs live validation.
 
 Requests requiring a new decision wait for an enrolled approver for up to five minutes, then expire. The agent must inspect the outcome and create a fresh request if approval is still needed. SMS, email, authenticator push, number matching and hardware touch are not supplied by TOTP permission. They require the actual factor and protected user interaction.
 

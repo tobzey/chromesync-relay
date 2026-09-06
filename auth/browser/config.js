@@ -1,9 +1,26 @@
 import path from 'node:path';
+import { isIP } from 'node:net';
 import { fail } from './errors.js';
 
 const FIELDS = new Set(['username', 'password', 'totp']);
 const PURPOSES = new Set(['login', 'reauthentication']);
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+export function publicURL(value, testing = {}) {
+  let url;
+  try { url = new URL(value); } catch { fail('ORIGIN_NOT_ALLOWED'); }
+  if (typeof value !== 'string' || value.length > 4096 || url.username || url.password) fail('ORIGIN_NOT_ALLOWED');
+  if (testing.allowLoopbackHttp === true && LOOPBACK.has(url.hostname) && ['http:','https:'].includes(url.protocol)) return url;
+  const host=url.hostname.replace(/^\[|\]$/g,'').replace(/\.$/,'').toLowerCase();
+  if (url.protocol!=='https:' || /(^|\.)(localhost|local|internal)$/.test(host)) fail('ORIGIN_NOT_ALLOWED');
+  if (isIP(host)===4) {
+    const [a,b]=host.split('.').map(Number);
+    if ([0,10,127].includes(a) || a>=224 || (a===169&&b===254) || (a===172&&b>=16&&b<=31) ||
+      (a===192&&b===168) || (a===100&&b>=64&&b<=127) || (a===198&&[18,19].includes(b))) fail('ORIGIN_NOT_ALLOWED');
+  }
+  if (isIP(host)===6 && (/^(::|fc|fd|fe[89ab])/.test(host))) fail('ORIGIN_NOT_ALLOWED');
+  return url;
+}
 
 function string(value, name, max = 512) {
   if (typeof value !== 'string' || !value.length || value.length > max || /\0/.test(value)) fail('INVALID_SERVICE', `Invalid ${name}.`);
@@ -35,6 +52,26 @@ export function normalizeService(input, testing = {}) {
   const startOrigin = new URL(startUrl).origin;
   const flows = input.authentication?.flows ?? [];
   if (!Array.isArray(flows) || flows.length > 16) fail('INVALID_SERVICE', 'Invalid authentication flows.');
+  let adaptive;
+  if (input.authentication?.mode === 'adaptive') {
+    if (flows.length) fail('INVALID_SERVICE','Adaptive authentication cannot contain configured flows.');
+    for (const origin of origins) publicURL(origin,testing);
+    const method=input.authentication.method ?? 'password';
+    if (!['password','passkey'].includes(method)) fail('INVALID_SERVICE','Invalid adaptive method.');
+    adaptive={method};
+    if (input.authentication.expectedUsername!==undefined) adaptive.expectedUsername=string(input.authentication.expectedUsername,'expected account identity');
+    if (input.authentication.verification!==undefined) {
+      const rule=input.authentication.verification;
+      if (!rule || typeof rule!=='object' || Array.isArray(rule)) fail('INVALID_SERVICE');
+      adaptive.verification={selector:string(rule.selector,'verification selector'),value:string(rule.value,'verification identity')};
+      if (rule.attribute!==undefined) {
+        if (typeof rule.attribute!=='string' || rule.attribute.length>64 || !/^data-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(rule.attribute)) fail('INVALID_SERVICE');
+        adaptive.verification.attribute=rule.attribute;
+      }
+      Object.freeze(adaptive.verification);
+    }
+    Object.freeze(adaptive);
+  } else if (input.authentication?.mode!==undefined && input.authentication.mode!=='configured') fail('INVALID_SERVICE');
   const ids = new Set();
   const normalized = flows.map(flow => {
     const flowId = string(flow.id, 'flow ID', 128);
@@ -81,7 +118,8 @@ export function normalizeService(input, testing = {}) {
     return Object.freeze({id:flowId, purpose:flow.purpose, match, steps, success, timeoutMs});
   });
   return Object.freeze({id, name: typeof input.name === 'string' ? input.name.slice(0, 128) : id,
-    origins, startUrl, flows:normalized, credentialSelectors:normalized.flatMap(flow => flow.steps.filter(step => step.type === 'fill').map(step => step.selector))});
+    origins, startUrl, flows:normalized, ...(adaptive?{adaptive}:{}),
+    credentialSelectors:adaptive ? ['input[type="password"]','input[type="email"]','input[autocomplete="username"]','input[autocomplete="one-time-code"]'] : normalized.flatMap(flow => flow.steps.filter(step => step.type === 'fill').map(step => step.selector))});
 }
 
 export function validateProfileRoot(profileRoot) {

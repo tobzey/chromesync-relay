@@ -157,9 +157,15 @@ export async function createManagedPasskeyProvider({ home, chromePath, receiverP
     entry.starting = starting;
     try { await starting; } finally { if (entry.starting === starting) entry.starting = undefined; }
   };
-  const prepareProfile = async ({ profilePath, session, receiverUrl }) => {
+  const prepareProfile = async ({ profilePath, session, receiverUrl, catalogOrigin = false }) => {
     await releasing;
-    if (!config || closed || preparing || active || !config.origins.includes(session.origin)) return {};
+    const origin = normalizeOrigin(session.origin);
+    const eligible = config && !closed && !preparing && !active &&
+      (config.origins.includes(origin) || (catalogOrigin === true && origin.startsWith('https://')));
+    if (!eligible) {
+      if (catalogOrigin) throw new Error('Passkey receiver unavailable');
+      return {};
+    }
     identifier(session.id);
     const enrolledReceiverUrl = normalizeReceiverUrl(receiverUrl ?? `${session.origin}/`, session.origin);
     preparing = true;
@@ -178,6 +184,7 @@ export async function createManagedPasskeyProvider({ home, chromePath, receiverP
     } catch {
       await releaseSession(session.id);
       if (directory) await fs.rm(directory, { recursive: true, force: true });
+      if (catalogOrigin) throw new Error('Passkey receiver unavailable');
       return {};
     } finally { preparing = false; }
   };
@@ -228,6 +235,11 @@ export async function createManagedPasskeyProvider({ home, chromePath, receiverP
   return {
     chromePath: config?.chromePath,
     prepareProfile, provider, releaseSession,
+    rebindService(sessionId, serviceId) {
+      identifier(sessionId); identifier(serviceId);
+      if (!active || active.sessionId !== sessionId || active.ceremony) throw new Error('Passkey session unavailable');
+      active.serviceId = serviceId;
+    },
     receiverObserve: receiverView.receiverObserve,
     receiverClick: receiverView.receiverClick,
     receiverType: receiverView.receiverType,

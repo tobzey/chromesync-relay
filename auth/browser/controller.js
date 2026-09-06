@@ -1,10 +1,11 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { normalizeService, allowedURL, validateProfileRoot } from './config.js';
+import { normalizeService, allowedURL, publicURL, validateProfileRoot } from './config.js';
 import { launchManagedChrome } from './cdp-pipe.js';
 import { BrowserControllerError, fail, abortIfNeeded } from './errors.js';
 import { createCredentialRedactor } from './redaction.js';
 import { inspectPage, observePage, interactPage, selectorState, fillSelector, clickSelector, clearCredentialFields, focusedInputState } from './page.js';
+import { adaptivePage } from './adaptive.js';
 
 const safeReason = error => error instanceof BrowserControllerError ? error.code : 'AUTHENTICATION_FAILED';
 const snapshotMatches = (expected, actual) => expected.id === actual.id && expected.ownerId === actual.ownerId &&
@@ -99,6 +100,20 @@ export function createBrowserController({chromePath, profileRoot, services = [],
 
   async function inspect(session, signal) {
     const {origin} = await actualFrame(session, signal);
+    if (session.service.adaptive) {
+      const state=await callPage(session,adaptivePage,[session.stateKey,session.planKey,'inspect',{
+        method:session.service.adaptive.method,expectedUsername:session.adaptive.expectedUsername,verification:session.service.adaptive.verification}],signal);
+      // An SPA can replace the account screen without navigating. A fresh
+      // challenge permanently consumes the owner's prior document confirmation.
+      if(state.challenge)session.adaptive.manualVerified=null;
+      const manual=session.adaptive.manualVerified;
+      const verified=state.verified || (!state.challenge&&manual?.origin===origin&&manual.loaderId===session.loaderId);
+      const purpose=verified?'authenticated':state.prepared&&!state.newPassword?'login':'unknown';
+      const fingerprint=createHash('sha256').update(JSON.stringify([origin,session.loaderId,state.structure,state.prepared,verified])).digest('hex');
+      if(session.fingerprint&&session.fingerprint!==fingerprint)session.revision++;
+      session.fingerprint=fingerprint;session.origin=origin;
+      return {id:session.id,ownerId:session.ownerId,serviceId:session.service.id,origin,purpose,revision:session.revision,flowId:state.prepared?'adaptive':null};
+    }
     const states = await callPage(session, inspectPage, [session.service.flows], signal);
     const matched = states.filter(state => state.match);
     const selected = matched.length === 1 ? session.service.flows.find(flow => flow.id === matched[0].id) : null;
@@ -125,16 +140,19 @@ export function createBrowserController({chromePath, profileRoot, services = [],
       session.handles.clear();
       session.frameId = params.frame.id;
       session.loaderId = params.frame.loaderId;
+      if(session.adaptive)session.adaptive.manualVerified=null;
     }
     if (method === 'Page.navigatedWithinDocument' && params.frameId === session.frameId) {
       session.revision++;
       session.handles.clear();
+      if(session.adaptive)session.adaptive.manualVerified=null;
     }
     if (method === 'Runtime.executionContextsCleared') session.contextId = null;
     if (method === 'Fetch.requestPaused') {
       let permitted = false;
       try {
-        allowedURL(params.request.url,session.service.origins,testing);
+        if(session.service.adaptive && params.resourceType!=='Document')publicURL(params.request.url,testing);
+        else allowedURL(params.request.url,session.service.origins,testing);
         permitted = params.resourceType !== 'Document' || !session.frameId || params.frameId === session.frameId;
       } catch {}
       const command = permitted ? 'Fetch.continueRequest' : 'Fetch.failRequest';
@@ -188,6 +206,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
   }
 
   async function verifySuccess(session, flow, signal, deadline) {
+    if(session.service.adaptive)return (await inspect(session,signal)).purpose==='authenticated';
     if (!await waitForSelector(session,flow.success.selector,signal,deadline,flow.success.origin)) return false;
     // An enrolled success signal must be accompanied by disappearance of the
     // original challenge and the exact enrolled account identity. The marker
@@ -204,6 +223,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
   }
 
   async function fillFlow(session, lease, flow, credentials) {
+    if(session.service.adaptive)return fillAdaptive(session,lease,credentials);
     if (!credentials || typeof credentials !== 'object') return {status:'failed',reason:'CREDENTIALS_UNAVAILABLE'};
     const deadline = Math.min(lease.deadline,Date.now()+flow.timeoutMs);
     let value;
@@ -255,12 +275,79 @@ export function createBrowserController({chromePath, profileRoot, services = [],
     } finally { value = undefined; credentials = undefined; }
   }
 
+  async function fillAdaptive(session,lease,credentials) {
+    if(!credentials || typeof credentials!=='object')return {status:'failed',reason:'CREDENTIALS_UNAVAILABLE'};
+    const deadline=Math.min(lease.deadline,Date.now()+120000);
+    const used={username:0,password:0,totp:0,passkey:0};
+    if(typeof credentials.username==='string'&&credentials.username.length&&credentials.username.length<=512){
+      if(session.adaptive.expectedUsername&&session.adaptive.expectedUsername!==credentials.username)return {status:'needs-user',reason:'ACCOUNT_MISMATCH'};
+      session.adaptive.expectedUsername=credentials.username;session.redactor.remember(credentials.username);
+    }
+    let values;
+    try {
+      for(let step=0;step<8&&Date.now()<deadline;step++){
+        abortIfNeeded(lease.signal);
+        if(session.lease!==lease||!lease.active)fail('ABORTED');
+        const current=await inspect(session,lease.signal);
+        if(current.purpose==='authenticated')return {status:'authenticated'};
+        const state=await callPage(session,adaptivePage,[session.stateKey,session.planKey,'inspect',{}],lease.signal);
+        if(state.newPassword)return {status:'needs-user',reason:'PASSWORD_CHANGE_FORBIDDEN'};
+        if(!state.prepared)return {status:'needs-user',reason:'VERIFICATION_REQUIRED'};
+        const before=session.loaderId+'|'+state.structure;
+        if(state.method==='passkey'){
+          if(++used.passkey>1||typeof credentials.passkey!=='function')return {status:'needs-user',reason:'PASSKEY_PROVIDER_UNAVAILABLE'};
+          session.credentialsUsed=true;session.quarantined=true;
+          const signing=Promise.resolve().then(()=>credentials.passkey({sessionId:session.id,signal:lease.signal,assertCurrent:lease.assertCurrent}));
+          signing.catch(()=>{});
+          await mouseClick(session,await callPage(session,adaptivePage,[session.stateKey,session.planKey,'submit',{}],lease.signal),lease.signal);
+          const result=await signing;
+          if(result?.completed!==true&&result?.authenticated!==true&&result?.status!=='authenticated')return {status:'needs-user',reason:'PASSKEY_NOT_COMPLETED'};
+        } else {
+          values={};
+          for(const field of state.fields){
+            if(++used[field]>(field==='username'?2:field==='totp'?3:1))return {status:'needs-user',reason:'AUTHENTICATION_RETRY_REQUIRED'};
+            let value=credentials[field];
+            if(field==='totp'&&typeof value==='function')value=await value({signal:lease.signal});
+            abortIfNeeded(lease.signal);
+            if(typeof value!=='string'||!value||value.length>16384)return {status:'needs-user',reason:field==='totp'?'TOTP_UNAVAILABLE':'CREDENTIALS_UNAVAILABLE'};
+            session.redactor.remember(value);values[field]=value;value=undefined;
+          }
+          if(session.lease!==lease||!lease.active)fail('ABORTED');
+          session.credentialsUsed=true;session.quarantined=true;
+          await callPage(session,adaptivePage,[session.stateKey,session.planKey,'fill',values],lease.signal);
+          values=undefined;
+          await mouseClick(session,await callPage(session,adaptivePage,[session.stateKey,session.planKey,'submit',{}],lease.signal),lease.signal);
+        }
+        // Wait for an actual new challenge/document. Never resubmit the same
+        // form merely because its asynchronous response has not arrived yet.
+        const transitionDeadline=Math.min(deadline,Date.now()+10000);
+        let next;
+        while(Date.now()<transitionDeadline){
+          abortIfNeeded(lease.signal);
+          if(session.blockedNavigation)fail('ORIGIN_NOT_ALLOWED');
+          try{
+            const snapshot=await inspect(session,lease.signal);
+            if(snapshot.purpose==='authenticated')return {status:'authenticated'};
+            next=await callPage(session,adaptivePage,[session.stateKey,session.planKey,'inspect',{}],lease.signal);
+            if(session.loaderId+'|'+next.structure!==before)break;
+          }catch(error){if(['ABORTED','BROWSER_CLOSED','ORIGIN_NOT_ALLOWED'].includes(error.code))throw error;}
+          await delay(100,undefined,{signal:lease.signal}).catch(()=>abortIfNeeded(lease.signal));
+        }
+        if(!next || session.loaderId+'|'+next.structure===before)return {status:'needs-user',reason:'AUTHENTICATION_RETRY_REQUIRED'};
+        if(!next.challenge)return {status:'needs-user',reason:'VERIFICATION_REQUIRED'};
+        await callPage(session,adaptivePage,[session.stateKey,session.planKey,'prepare',{method:'password'}],lease.signal);
+      }
+      return {status:'needs-user',reason:'FLOW_TIMEOUT'};
+    }finally{values=undefined;credentials=undefined;}
+  }
+
   async function closeOwnedSession(session) {
     if (session.closing) return session.closing;
     session.closed = true;
     if (session.lease?.kind === 'takeover') releaseTakeover(session.lease,true);
     session.lease?.abortController.abort();
     sessions.delete(session.id);
+    if(session.discoveryServiceId)serviceMap.delete(session.discoveryServiceId);
     session.handles.clear();
     session.redactor.clear();
     session.closing=(async()=>{
@@ -293,7 +380,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
     } finally {lease.busy=false;}
   }
 
-  return Object.freeze({
+  const api=Object.freeze({
     validateService(service) {
       normalizeService(service,testing);
       return {status:'valid'};
@@ -317,6 +404,53 @@ export function createBrowserController({chromePath, profileRoot, services = [],
       await Promise.all([...sessions.values()].filter(session=>session.ownerId===requesterId).map(closeOwnedSession));
       return {status:'closed'};
     },
+    async openDiscoverySession(url,requesterId,{method='password'}={}) {
+      const target=publicURL(url,testing);
+      if(!['password','passkey'].includes(method))fail('INVALID_METHOD');
+      const id=`discovery-${randomUUID()}`;
+      serviceMap.set(id,normalizeService({id,origins:[target.origin],startUrl:target.href,authentication:{mode:'adaptive',method}},testing));
+      try{
+        const snapshot=await api.openSession(id,requesterId);
+        const session=owned(snapshot.id,requesterId);session.discovery=true;session.discoveryServiceId=id;
+        return snapshot;
+      }catch(error){serviceMap.delete(id);throw error;}
+    },
+    bindDiscoveredAccount(id,requesterId,definition) {
+      return agentOperation(id,requesterId,async session=>{
+        if(!session.discovery||session.credentialsUsed||session.boundAccount)fail('ACCOUNT_ALREADY_BOUND');
+        const service=normalizeService(definition,testing);
+        const current=await actualFrame(session);
+        if(!service.adaptive||!service.origins.has(current.origin)||new URL(service.startUrl).origin!==current.origin)fail('ORIGIN_NOT_ALLOWED');
+        if(service.adaptive.method!==session.service.adaptive.method)fail('METHOD_MISMATCH');
+        serviceMap.set(service.id,service);session.service=service;session.boundAccount=true;session.discovery=false;
+        reservations.get(id).service=service;
+        session.adaptive.expectedUsername=service.adaptive.expectedUsername;
+        if(service.adaptive.expectedUsername)session.redactor.remember(service.adaptive.expectedUsername);
+        if(service.adaptive.verification)session.redactor.remember(service.adaptive.verification.value);
+        session.revision++;session.handles.clear();session.fingerprint=null;
+        return inspect(session);
+      });
+    },
+    prepareAuthentication(id,requesterId,{revision,bindings,method}={}) {
+      return agentOperation(id,requesterId,async session=>{
+        if(!session.service.adaptive||session.discovery||!session.boundAccount)fail('ACCOUNT_NOT_BOUND');
+        const current=await inspect(session);
+        if(!Number.isSafeInteger(revision)||revision!==current.revision)fail('STALE_HANDLE');
+        const selected=method??session.service.adaptive.method;
+        if(selected!==session.service.adaptive.method)fail('METHOD_MISMATCH');
+        if(bindings!==undefined){
+          if(!bindings||typeof bindings!=='object'||Array.isArray(bindings)||Object.keys(bindings).some(key=>!['username','password','totp','submit'].includes(key)))fail('INVALID_BINDINGS');
+          for(const [field,raw] of Object.entries(bindings)){
+            const handles=Array.isArray(raw)?raw:[raw];
+            if(!handles.length||handles.length>8||(field!=='totp'&&handles.length!==1))fail('INVALID_BINDINGS');
+            for(const handle of handles)if(typeof handle!=='string'||session.handles.get(handle)!==current.revision)fail('STALE_HANDLE');
+          }
+        }
+        await callPage(session,adaptivePage,[session.stateKey,session.planKey,'prepare',{method:selected,bindings}]);
+        session.revision++;session.handles.clear();
+        return inspect(session);
+      });
+    },
     async openSession(serviceId,requesterId) {
       if (stopped) fail('CONTROLLER_CLOSED');
       if (typeof requesterId !== 'string' || !requesterId.length || requesterId.length > 256) fail('INVALID_REQUESTER');
@@ -336,15 +470,18 @@ export function createBrowserController({chromePath, profileRoot, services = [],
         browser=await launchManagedChrome({chromePath,profileRoot,headless,extensionPaths,signal,
           prepareProfile:async({profilePath})=>{
             assertReservation(reservation);
-            const prepared=await prepareProfile?.({profilePath,signal,session:{id,ownerId:requesterId,serviceId,origin:new URL(service.startUrl).origin}});
+            const prepared=await prepareProfile?.({profilePath,signal,service,session:{id,ownerId:requesterId,serviceId,origin:new URL(service.startUrl).origin,method:service.adaptive?.method}});
             assertReservation(reservation);
             return prepared;
           }});
         assertReservation(reservation);
         session={id,ownerId:requesterId,service,browser,revision:1,handles:new Map(),
           worldName:`chromesync-${randomUUID()}`,stateKey:randomUUID(),redactor:createCredentialRedactor(),closed:false,
-          lease:null,activeOperation:false,quarantined:false,blockedNavigation:false};
+          lease:null,activeOperation:false,quarantined:false,blockedNavigation:false,planKey:randomUUID(),credentialsUsed:false,
+          ...(service.adaptive?{adaptive:{expectedUsername:service.adaptive.expectedUsername},boundAccount:!service.id.startsWith('discovery-')}: {})};
         for (const flow of service.flows) session.redactor.remember(flow.success.account.value);
+        if(service.adaptive?.expectedUsername)session.redactor.remember(service.adaptive.expectedUsername);
+        if(service.adaptive?.verification)session.redactor.remember(service.adaptive.verification.value);
         const {targetId} = await browser.connection.send('Target.createTarget',{url:'about:blank'},undefined,{signal});
         session.targetId = targetId;
         const attached = await browser.connection.send('Target.attachToTarget',{targetId,flatten:true},undefined,{signal});
@@ -396,7 +533,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
     observe(id,requesterId) {
       return agentOperation(id,requesterId,async session => {
         const current = await inspect(session);
-        const observation = await callPage(session,observePage,[session.stateKey,session.service.credentialSelectors,200]);
+        const observation = await callPage(session,observePage,[session.stateKey,session.service.credentialSelectors,200,!!session.service.adaptive]);
         session.handles = new Map(observation.elements.filter(el => el.handle).map(el => [el.handle,current.revision]));
         // Only strings derived from page content need redaction. Account IDs
         // can be short; rewriting trusted UUID handles would make them invalid.
@@ -446,7 +583,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
       try {
         const current = await inspect(session,lease.signal);
         if (!snapshotMatches(expected,current)) fail('SESSION_CHANGED', 'The browser changed after the authentication request.');
-        const flow = session.service.flows.find(item => item.id === current.flowId);
+        const flow = session.service.adaptive&&current.flowId==='adaptive'?{timeoutMs:120000}:session.service.flows.find(item => item.id === current.flowId);
         if (!flow || !['login','reauthentication'].includes(current.purpose)) fail('AUTH_FLOW_UNAVAILABLE');
         const sink = async credentials => {
           if (!lease.active || session.lease !== lease) fail('ABORTED');
@@ -472,7 +609,8 @@ export function createBrowserController({chromePath, profileRoot, services = [],
             session.quarantined = true;
             return {status:'needs-user',reason:'SUCCESS_NOT_CONFIRMED'};
           }
-          await callPage(session,clearCredentialFields,[session.service.credentialSelectors],lease.signal);
+          if(session.service.adaptive)await callPage(session,adaptivePage,[session.stateKey,session.planKey,'clear',{}],lease.signal);
+          else await callPage(session,clearCredentialFields,[session.service.credentialSelectors],lease.signal);
           session.quarantined = false;
           return {status:'authenticated'};
         }
@@ -565,12 +703,27 @@ export function createBrowserController({chromePath, profileRoot, services = [],
         return {status:'ok'};
       });
     },
-    finishTakeover(takeoverId,{cancel=false} = {}) {
+    finishTakeover(takeoverId,{cancel=false,confirmAuthenticated=false} = {}) {
       return takeoverOperation(takeoverId,async (session,lease) => {
+        if(typeof confirmAuthenticated!=='boolean')fail('INVALID_CONFIRMATION');
         let success=false;
         try {
           if (!cancel) {
-            const {origin}=await actualFrame(session,lease.signal);
+            const {origin,frame}=await actualFrame(session,lease.signal);
+            if(session.service.adaptive){
+              if(session.discovery||!session.boundAccount)fail('ACCOUNT_NOT_BOUND');
+              const state=await callPage(session,adaptivePage,[session.stateKey,session.planKey,'inspect',{
+                method:session.service.adaptive.method,expectedUsername:session.adaptive.expectedUsername,verification:session.service.adaptive.verification}],lease.signal);
+              const confirmed=!state.challenge&&(confirmAuthenticated||(await inspect(session,lease.signal)).purpose==='authenticated');
+              if(confirmed){
+                await callPage(session,adaptivePage,[session.stateKey,session.planKey,'clear',{}],lease.signal);
+                const after=(await actualFrame(session,lease.signal)).frame;
+                if(after.id!==frame.id||after.loaderId!==frame.loaderId||after.url!==frame.url)fail('SESSION_CHANGED');
+                session.adaptive.manualVerified={origin,loaderId:frame.loaderId};
+                success=true;
+              }
+              return success?{status:'authenticated'}:{status:'needs-user',reason:'VERIFICATION_REQUIRED'};
+            }
             const states=await callPage(session,inspectPage,[session.service.flows],lease.signal);
             success=states.some(state=>{
               const flow=session.service.flows.find(item=>item.id===state.id);
@@ -579,11 +732,32 @@ export function createBrowserController({chromePath, profileRoot, services = [],
             if (success) await callPage(session,clearCredentialFields,[session.service.credentialSelectors],lease.signal);
           }
           return success ? {status:'authenticated'} : {status:'needs-user',reason:cancel?'TAKEOVER_CANCELLED':'SUCCESS_NOT_CONFIRMED'};
-        } finally {releaseTakeover(lease,!success);}
+        } catch(error) {success=false;throw error;}
+        finally {releaseTakeover(lease,!success);}
       });
     },
     closeSession(id,requesterId) {
       return agentOperation(id,requesterId,closeOwnedSession,{allowQuarantined:true});
+    },
+    exportSession(id,requesterId) {
+      return agentOperation(id,requesterId,async session=>{
+        const current=await inspect(session);
+        if(current.purpose!=='authenticated'||session.discovery)fail('AUTHENTICATION_REQUIRED');
+        const {frame}=await actualFrame(session);
+        const source=new URL(frame.url),url=source.origin+source.pathname;
+        const result=await session.browser.connection.send('Storage.getCookies',{});
+        const afterFrame=(await actualFrame(session)).frame;
+        if(afterFrame.id!==frame.id||afterFrame.loaderId!==frame.loaderId||afterFrame.url!==frame.url)fail('SESSION_CHANGED');
+        const after=await inspect(session);
+        if(!snapshotMatches(current,after)||after.purpose!=='authenticated')fail('SESSION_CHANGED');
+        const cookies=result.cookies.filter(cookie=>cookie.domain===source.hostname||cookie.domain==='.'+source.hostname);
+        if(cookies.length>200)fail('SESSION_EXPORT_TOO_LARGE');
+        const output={version:1,origin:source.origin,url,cookies};
+        const encoded=JSON.stringify(output);
+        if(Buffer.byteLength(encoded)>80*1024)fail('SESSION_EXPORT_TOO_LARGE');
+        if(JSON.stringify(session.redactor.redact(output))!==encoded)fail('CREDENTIAL_ECHO');
+        return output;
+      });
     },
     async close() {
       stopped = true;
@@ -591,4 +765,5 @@ export function createBrowserController({chromePath, profileRoot, services = [],
       await Promise.all([...sessions.values()].map(closeOwnedSession));
     },
   });
+  return api;
 }

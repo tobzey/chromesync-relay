@@ -852,7 +852,7 @@ test('persistent growth rejects early while owner pages, denial and revocation r
   assert.equal((await f.request('rejected-for-space')).status, 'pending', 'safely aged outcomes make room for later work');
 });
 
-test('audit compaction preserves the latest events and enrollment plus active-policy admission remain bounded', async (t) => {
+test('audit compaction preserves the latest events and active-policy admission remains bounded', async (t) => {
   const f = await fixture(t);
   const first = await f.request();
   await f.broker.decide(first.requestId, { decision: 'always' }, 'owner-1');
@@ -860,17 +860,48 @@ test('audit compaction preserves the latest events and enrollment plus active-po
     state.audit = Array.from({ length: 10000 }, (_, index) => ({ id: `event-${index}`, actorId: 'actor'.repeat(100), event: 'synthetic', time: index }));
     const policy = state.policies[0];
     state.policies = Array.from({ length: 1000 }, (_, index) => ({ ...policy, id: `policy-${index}`, requesterId: `other-agent-${index}` }));
-    const service = state.enrollments[0];
-    state.enrollments = Array.from({ length: 100 }, (_, index) => ({ ...service, serviceId: index ? `service-${index}` : 'example' }));
   });
   const state = await f.store.read();
   assert.ok(state.audit.length <= 2000);
   assert.ok(Buffer.byteLength(JSON.stringify(state.audit)) <= 256 * 1024);
   assert.equal(state.audit.at(-1).id, 'event-9999');
-  assert.equal((await f.broker.putEnrollment({ ...enrolled, serviceId: 'over-limit' }, 'owner-1')).reason, 'enrollment-capacity');
   f.addSession('policy-over-limit');
   const request = await f.request('policy-over-limit');
   assert.equal((await f.broker.decide(request.requestId, { decision: 'always' }, 'owner-1')).reason, 'policy-capacity');
   assert.equal((await f.broker.decide(request.requestId, { decision: 'deny' }, 'owner-1')).status, 'denied');
   assert.equal((await f.broker.listPolicies()).length, 1000);
+});
+
+test('5000 compact enrollments reach the resource count bound before the independent byte budget', async (t) => {
+  const f = await fixture(t);
+  await f.store.mutate((state) => {
+    const service = state.enrollments[0];
+    state.enrollments = Array.from({ length: 5000 }, (_, index) => ({ ...service, serviceId: index ? `service-${index}` : 'example' }));
+  });
+  assert.ok(authDataBytes(await f.store.read()) < AUTH_DATA_BUDGET - 4096, 'count-limit fixture must not accidentally test storage exhaustion');
+  assert.equal((await f.broker.putEnrollment({ ...enrolled, serviceId: 'over-limit' }, 'owner-1')).reason, 'enrollment-capacity');
+  assert.equal((await f.broker.listEnrollmentsPage({ limit: 20 })).items.length, 20);
+  const existing = await f.broker.putEnrollment({ ...enrolled, name: 'Updated existing account' }, 'owner-1');
+  assert.equal(existing.serviceId, 'example'); assert.equal(existing.version, 2);
+  assert.equal((await f.store.read()).enrollments.length, 5000);
+});
+
+test('catalog-derived resources can be admitted beyond 100 accounts without granting authentication', async (t) => {
+  const f = await fixture(t);
+  const catalog = index => ({
+    serviceId: `account-${index}`, accountId: `account-${index}`, name: `Catalog account ${index}`,
+    provider: 'onepassword', providerId: 'default', vaultId: 'catalog-vault', itemId: `item-${index}`,
+    origins: ['https://example.test'], factors: ['password'], fields: { password: { id: 'password' } },
+    startUrl: 'https://example.test/', authentication: { mode: 'adaptive', method: 'password', flows: [] },
+    catalog: { label: `Catalog account ${index}`, sourceOrigins: ['https://example.test'], originMatch: true, accountVerificationRequired: false },
+  });
+  await f.store.mutate((state) => {
+    state.enrollments = Array.from({ length: 100 }, (_, index) => ({ ...catalog(index), version: 1, createdAt: 1_000_000, updatedAt: 1_000_000 }));
+  });
+  const saved = await f.broker.putEnrollment(catalog(100), 'owner-1');
+  assert.equal(saved.serviceId, 'account-100'); assert.equal(saved.version, 1);
+  const state = await f.store.read();
+  assert.equal(state.enrollments.length, 101); assert.equal(state.requests.length, 0); assert.equal(state.policies.length, 0);
+  assert.ok(authDataBytes(state) < AUTH_DATA_BUDGET);
+  assert.equal(f.calls.provider, 0); assert.equal(f.calls.sink, 0);
 });
