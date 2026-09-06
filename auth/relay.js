@@ -1,4 +1,5 @@
-import { readOnly } from './operations.js';
+import { diagnosticCode } from './diagnostic-codes.js';
+import { readOnly, operations } from './operations.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { relayPush, relayList, relayGet, relayDelete } from '../companion/relay-client.js';
 import { sealMessage, openMessage, newId, messageName, MESSAGE_TTL, MAX_MESSAGE_BYTES } from './protocol.js';
@@ -28,7 +29,7 @@ export function createRelayCaller({ identity, peer, io = DEFAULT_IO, now = Date.
       for (;;) {
         try { await io.push({ ...peer.channel, name, blob: request }); break; }
         catch (error) {
-          capacity = error.status === 507;
+          capacity ||= error.status === 507;
           if (signal?.aborted || now() - started >= timeoutMs) return uncertain();
           if (error.status && ![429, 503, 507].includes(error.status)) throw error;
           // No response does not prove rejection. Retry the same encrypted
@@ -47,7 +48,7 @@ export function createRelayCaller({ identity, peer, io = DEFAULT_IO, now = Date.
             if (value.type !== 'response' || value.replyTo !== id) throw new Error('Response binding failed');
             await io.delete({ ...peer.channel, name: responseName }).catch(() => {});
             if (!value.ok) {
-              const code = typeof value.code === 'string' && /^[A-Z_]{1,40}$/.test(value.code) ? value.code : 'OPERATION_REJECTED';
+              const code = diagnosticCode(value.code) || 'OPERATION_REJECTED';
               throw Object.assign(new Error(`Authentication operation rejected (${code})`), { code, operationRejected: true });
             }
             return value.result;
@@ -73,7 +74,11 @@ export function createRelayCaller({ identity, peer, io = DEFAULT_IO, now = Date.
   };
 }
 
-export function createRelayExecutor({ identity, getPeers, store, dispatch, isReadOnly = () => false, isEphemeral = operation => ['auth.wait', 'takeover.observe', 'passkey.observe'].includes(operation), io = DEFAULT_IO, now = Date.now }) {
+export function createRelayExecutor({ identity, getPeers, store, dispatch, isReadOnly = operation => readOnly.has(operation), isEphemeral = operation => ['auth.wait', 'takeover.observe', 'passkey.observe'].includes(operation), io = DEFAULT_IO, now = Date.now }) {
+  for (const operation of operations) {
+    if (isEphemeral(operation) && !isReadOnly(operation)) throw new Error('Ephemeral operations must be read-only');
+  }
+  const activeEntries = new Map();
   let polling = false, rejectedEnvelopes = 0;
   const active = new Set();
   const jobs = new Set();
@@ -84,18 +89,20 @@ export function createRelayExecutor({ identity, getPeers, store, dispatch, isRea
     const entries = await io.list(peer.channel);
     for (const entry of entries.slice(0, 100)) {
       if (typeof entry.name !== 'string') continue;
-      if (ephemeralResponses.has(entry.name)) {
-        if (ephemeralResponses.get(entry.name) <= now()) {
+      const entryKey = `${peer.identity.id}:${entry.name}`;
+      if (activeEntries.has(entryKey)) continue;
+      if (ephemeralResponses.has(entryKey)) {
+        if (ephemeralResponses.get(entryKey) <= now() && !(entry.mtime > now())) {
           await io.delete({ ...peer.channel, name: entry.name }).catch(() => {});
-          ephemeralResponses.delete(entry.name);
+          ephemeralResponses.delete(entryKey);
         }
         continue;
       }
       if (ownResponses.has(entry.name)) {
-        if (ownResponses.get(entry.name).expiresAt <= now()) await io.delete({ ...peer.channel, name: entry.name }).catch(() => {});
+        if (ownResponses.get(entry.name).expiresAt <= now() && !(entry.mtime > now())) await io.delete({ ...peer.channel, name: entry.name }).catch(() => {});
         continue;
       }
-      if (Number.isFinite(entry.mtime) && entry.mtime <= now() && entry.mtime < now() - 2 * MESSAGE_TTL) {
+      if (Number.isFinite(entry.mtime) && entry.mtime <= now() && entry.mtime < now() - 15 * 60_000) {
         await io.delete({ ...peer.channel, name: entry.name }).catch(() => {});
         continue;
       }
@@ -108,13 +115,15 @@ export function createRelayExecutor({ identity, getPeers, store, dispatch, isRea
       const commandKey = `${peer.identity.id}:${header.id}`;
       if (active.has(commandKey) || active.size >= 64) continue;
       active.add(commandKey);
-      const job = executeCommand(peer, entry, opened, commandKey).catch(() => {}).finally(() => { active.delete(commandKey); jobs.delete(job); });
+      activeEntries.set(entryKey, commandKey);
+      const job = executeCommand(peer, entry, opened, commandKey).catch(() => {}).finally(() => { active.delete(commandKey); activeEntries.delete(entryKey); jobs.delete(job); });
       jobs.add(job);
     }
   }
   async function executeCommand(peer, entry, { header, value }, commandKey) {
       let previous;
       let ephemeralRead = isEphemeral(value.operation);
+      if (ephemeralRead && !isReadOnly(value.operation)) throw new Error('Ephemeral operations must be read-only');
       let rejected = false;
       const readOnly = isReadOnly(value.operation);
       const owner = ['approver', 'executor'].includes(peer.identity.role);
@@ -149,7 +158,7 @@ export function createRelayExecutor({ identity, getPeers, store, dispatch, isRea
               const current = (await getPeers()).find(p => p.enabled && p.identity.id === peer.identity.id);
               if (!current) throw new Error('Peer revoked');
               outcome = { ok: true, result: await dispatch(value.operation, value.args, current.identity) };
-            } catch (error) { outcome = { ok: false, code: typeof error?.code === 'string' && /^[A-Z_]{1,40}$/.test(error.code) ? error.code : 'OPERATION_REJECTED' }; }
+            } catch (error) { outcome = { ok: false, code: diagnosticCode(error?.code) || 'OPERATION_REJECTED' }; }
           }
           const encode = (result) => sealMessage({ type: 'response', replyTo: header.id, ...result }, identity, peer.identity, { now: now() }).toString('base64url');
           const oversized = () => ({ ok: true, result: { status: readOnly ? 'failed' : 'uncertain', reason: 'response-capacity', commandId: header.id } });
@@ -162,7 +171,7 @@ export function createRelayExecutor({ identity, getPeers, store, dispatch, isRea
         }
         await io.push({ ...peer.channel, name: messageName('response', header.id), blob: Buffer.from(response, 'base64url') });
         if (ephemeralRead) {
-          ephemeralResponses.set(messageName('response', header.id), now() + MESSAGE_TTL);
+          ephemeralResponses.set(`${peer.identity.id}:${messageName('response', header.id)}`, now() + MESSAGE_TTL);
           if (ephemeralResponses.size > 512) ephemeralResponses.delete(ephemeralResponses.keys().next().value);
         }
         await io.delete({ ...peer.channel, name: entry.name });

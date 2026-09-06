@@ -210,7 +210,7 @@ test('restart can safely resume an approved grant that never started', async (t)
   await entered.promise;
   const restarted = createBroker({ ...f.configuration, store: createEncryptedStore({ path: f.path, key: f.key, now: f.configuration.now }) });
   const resumed = await restarted.resume();
-  assert.equal(resumed[0].status, 'succeeded');
+  assert.equal(resumed[0].value.status, 'succeeded');
   release.resolve();
   assert.equal((await beforeCrash).status, 'succeeded');
   assert.equal(f.calls.sink, 1);
@@ -940,8 +940,8 @@ test('store failure selecting execution preserves approved instead of browser-un
     return mutate(fn);
   } };
   const broker = createBroker({ ...f.configuration, store });
-  await assert.rejects(broker.decide(request.requestId, { decision: 'once' }, 'owner-1'), AuthStoreError);
-  assert.equal((await f.store.read()).requests[0].status, 'approved');
+  assert.equal((await broker.decide(request.requestId, { decision: 'once' }, 'owner-1')).status, 'succeeded');
+  assert.equal(f.calls.sink, 1);
 });
 
 test('pending requests sort newest first ahead of recovery rows and expose total attention count', async t => {
@@ -951,10 +951,14 @@ test('pending requests sort newest first ahead of recovery rows and expose total
     state.requests = [['old-pending', 'pending', 1], ['failed', 'failed', 9], ['new-pending', 'pending', 3], ['needs', 'needs-user', 10], ['approved-newer', 'approved', 99], ['authenticating-newer', 'authenticating', 98]].map(([id, status, createdAt]) => ({ ...row, id, status, createdAt }));
   });
   const first = await f.broker.listPendingPage({ limit: 2 });
-  assert.equal(first.openCount, 6);
+  assert.equal(first.openCount, 4);
   assert.deepEqual(first.items.map(r => r.requestId), ['new-pending', 'old-pending']);
   const second = await f.broker.listPendingPage({ limit: 2, cursor: first.nextCursor });
   assert.deepEqual(second.items.map(r => r.requestId), ['needs', 'failed']);
+  assert.deepEqual(second.pendingSummary.map(row => row.requestId), ['new-pending', 'old-pending']);
+  assert.equal(second.pendingSummary[0].origin, 'https://example.test');
+  assert.deepEqual(Object.keys(second.pendingSummary[0]).sort(), ['expiresAt', 'name', 'origin', 'requestId']);
+  assert(Buffer.byteLength(JSON.stringify(second.pendingSummary)) <= 8192);
   const third = await f.broker.listPendingPage({ limit: 2, cursor: second.nextCursor });
   assert.deepEqual(third.items.map(r => r.requestId), ['approved-newer', 'authenticating-newer']);
 });
@@ -993,4 +997,79 @@ test('wait timeout, requester cap, global cap and draining release every subscri
   await f.broker.drain({ abort: true });
   const outcomes = await Promise.all(waits);
   assert.equal(outcomes.length, 16); assert(outcomes.every(row => row.timedOut));
+});
+
+for (const code of ['SESSION_CHANGED', 'AUTH_FLOW_UNAVAILABLE', undefined, 'SECRET_SENTINEL']) test(`caught execution ${code} preserves uncertainty and fixed diagnostics`, async t => {
+  const f = await fixture(t);
+  f.controller.withAuthenticationLease = async () => { throw Object.assign(new Error('SECRET-SENTINEL'), { code, credentialsSupplied: true }); };
+  const request = await f.request();
+  const result = await f.broker.decide(request.requestId, { decision: 'once' }, 'owner-1');
+  assert.equal(result.reason, 'authentication-uncertain');
+  assert.equal(result.diagnostic.code, ['SESSION_CHANGED', 'AUTH_FLOW_UNAVAILABLE'].includes(code) ? code : 'EXECUTION_FAILED');
+});
+
+test('exhausted store retry keeps diagnostic and expired approved grant can be retried', async t => {
+  const f = await fixture(t); const request = await f.request();
+  let attempts = 0;
+  f.controller.inspectSession = async () => { attempts++; throw new AuthStoreError('Synthetic busy'); };
+  const result = await f.broker.decide(request.requestId, { decision: 'once' }, 'owner-1');
+  assert.equal(result.status, 'approved'); assert.equal(result.diagnostic.code, 'STORE_UNAVAILABLE'); assert.equal(attempts, 2);
+  f.advance(120001);
+  f.controller.inspectSession = async id => structuredClone(f.sessions.get(id));
+  const retried = await f.broker.retryRequest(request.requestId, 'owner-1');
+  assert.equal(retried.status, 'pending');
+});
+
+test('resume settles a failing row while another approved row executes', async t => {
+  const f = await fixture(t); await f.request(); f.addSession('other-session');
+  await f.store.mutate(state => {
+    const row = state.requests[0]; row.status = 'approved';
+    row.grant = { factors: row.factors, purposes: ['login'], approverId: 'owner-1', issuedAt: f.configuration.now(), expiresAt: f.configuration.now() + 120000 };
+    state.requests.push({ ...row, id: 'other-request', sessionId: 'other-session', session: { ...row.session, id: 'other-session' } });
+  });
+  f.controller.inspectSession = async id => { if (id === 'session-1') throw new AuthStoreError('Synthetic busy'); return structuredClone(f.sessions.get(id)); };
+  const results = await f.broker.resume();
+  assert.equal(results.length, 2); assert(results.every(row => row.status === 'fulfilled'));
+  assert.equal(results[0].value.diagnostic.code, 'STORE_UNAVAILABLE');
+  assert.equal(results[1].value.status, 'succeeded'); assert.equal(f.calls.sink, 1);
+});
+
+test('provider retirement retains authentication uncertainty and cancels unused approvals', async t => {
+  const f = await fixture(t); await f.request();
+  await f.store.mutate(state => {
+    const row = state.requests[0];
+    state.requests = ['pending', 'approved', 'authenticating', 'failed'].map(status => ({ ...row, id: status, status,
+      ...(status === 'failed' ? { diagnostic: { code: 'BROWSER_CLOSED', credentialsSupplied: true, at: 1 } } : {}) }));
+  });
+  await f.broker.retireProvider('default', 'owner-1');
+  const rows = (await f.store.read()).requests;
+  assert.deepEqual(rows.map(row => row.status), ['cancelled', 'cancelled', 'needs-user', 'needs-user']);
+  assert.equal(rows[2].reason, 'authentication-uncertain'); assert.equal(rows[3].diagnostic.code, 'BROWSER_CLOSED');
+});
+
+test('provider retirement aborts a running authentication without claiming cancellation', async t => {
+  const f = await fixture(t); const request = await f.request();
+  const entered = deferred(), release = deferred();
+  f.hooks.provider = async () => { entered.resolve(); await release.promise; };
+  const execution = f.broker.decide(request.requestId, { decision: 'once' }, 'owner-1');
+  await entered.promise;
+  try {
+    await f.broker.retireProvider('default', 'owner-1');
+    assert.equal(f.hooks.signal.aborted, true);
+    assert.equal((await execution).reason, 'authentication-uncertain'); assert.equal(f.calls.sink, 0);
+  } finally { release.resolve(); await f.broker.drain(); }
+});
+
+test('pending summary caps entries and encoded bytes independently of pagination', async t => {
+  const f = await fixture(t); await f.request();
+  await f.store.mutate(state => {
+    const row = state.requests[0];
+    state.requests = Array.from({ length: 30 }, (_, i) => ({ ...row, id: `summary-${i}`, createdAt: i }));
+  });
+  const first = await f.broker.listPendingPage({ limit: 1 });
+  assert.equal(first.pendingSummary.length, 20); assert.equal(first.pendingSummary[0].requestId, 'summary-29');
+  await f.store.mutate(state => { state.enrollments[0].name = 'Synthetic'.repeat(500); });
+  const second = await f.broker.listPendingPage({ limit: 1, cursor: first.nextCursor });
+  assert(second.pendingSummary.length > 0 && second.pendingSummary.length < 20);
+  assert(Buffer.byteLength(JSON.stringify(second.pendingSummary)) <= 8192);
 });

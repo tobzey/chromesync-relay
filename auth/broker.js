@@ -1,3 +1,5 @@
+import { setTimeout as delay } from 'node:timers/promises';
+import { diagnosticCode } from './diagnostic-codes.js';
 import { randomUUID } from 'node:crypto';
 import { AuthStoreError, admitAuthGrowth } from './store.js';
 import {
@@ -9,6 +11,7 @@ const OPEN = new Set(['pending', 'approved', 'authenticating', 'needs-user']);
 const RETRYABLE = new Set(['needs-user', 'failed']);
 const REQUEST_TTL = 5 * 60_000;
 const GRANT_TTL = 120_000;
+const retryable = (row, time) => RETRYABLE.has(row.status) || ((row.status === 'approved' || (row.status === 'expired' && row.diagnostic?.code === 'STORE_UNAVAILABLE')) && row.grant?.expiresAt <= time);
 const TERMINAL_RETENTION = 30 * 24 * 60 * 60_000;
 const MIN_TERMINAL_RETENTION = 15 * 60_000;
 const MAX_REQUESTS = 5000;
@@ -88,11 +91,6 @@ function abortable(operation, signal) {
   });
 }
 
-function diagnosticCode(value) {
-  if (typeof value !== 'string') return undefined;
-  const code = value.replaceAll('-', '_').toUpperCase();
-  return /^[A-Z_]{1,80}$/.test(code) ? code : undefined;
-}
 function diagnosticView(value) {
   const code = diagnosticCode(value?.code);
   return code ? { code, credentialsSupplied: value.credentialsSupplied === true } : undefined;
@@ -245,6 +243,7 @@ function invalidatePolicy(state, policy, time, approverId) {
 
   let initialization;
   const running = new Map();
+  const executionOutcomes = new Set();
   const aborters = new Map();
   const abortRequests = (ids) => { for (const id of ids) aborters.get(id)?.abort(abortError()); };
 
@@ -371,21 +370,23 @@ function invalidatePolicy(state, policy, time, approverId) {
         });
       } catch (error) {
         const storeError = error instanceof AuthStoreError;
-        let rethrow = false;
         await store.mutate((state) => {
           const row = state.requests.find((item) => item.id === id);
           if (!['approved','authenticating'].includes(row?.status)) return;
-          if (storeError && row.status === 'approved') { rethrow = true; return; }
-          const code = storeError ? 'STORE_UNAVAILABLE' : error?.name === 'AbortError' ? 'ABORTED' : diagnosticCode(error?.code);
           const supplied = error?.credentialsSupplied ?? credentialsSupplied;
+          if (storeError && row.status === 'approved' && supplied !== true) {
+            row.diagnostic = { code: 'STORE_UNAVAILABLE', credentialsSupplied: false, at: now() };
+            return;
+          }
+          const code = storeError ? 'STORE_UNAVAILABLE' : error?.name === 'AbortError' ? 'ABORTED' : diagnosticCode(error?.code) || 'EXECUTION_FAILED';
           if (code) row.diagnostic = { code, credentialsSupplied: supplied === true, at: now() };
-          if (code === 'SESSION_CHANGED') setState(state, row, 'needs-user', 'session-changed', now());
+          if (supplied === true) setState(state, row, 'needs-user', 'authentication-uncertain', now());
+          else if (code === 'SESSION_CHANGED') setState(state, row, 'needs-user', 'session-changed', now());
           else if (code === 'AUTH_FLOW_UNAVAILABLE') setState(state, row, 'needs-user', 'unrecognized-authentication', now());
           else if (['BROWSER_CLOSED','SESSION_NOT_FOUND'].includes(code) && !supplied) setState(state, row, 'failed', 'browser-unavailable', now());
           else if (row.status === 'authenticating' || supplied) setState(state, row, 'needs-user', 'authentication-uncertain', now());
           else if (code !== 'ABORTED') setState(state, row, 'failed', 'browser-unavailable', now());
         });
-        if (rethrow) throw error;
       }
       return readCurrent(id);
     })();
@@ -397,7 +398,24 @@ function invalidatePolicy(state, policy, time, approverId) {
 
   function executionOutcome(saved, waitForExecution) {
     if (saved.status !== 'approved') return saved;
-    const work = execute(saved.requestId);
+    const work = (async () => {
+      let current = saved;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try { current = await execute(saved.requestId); }
+        catch (error) {
+          if (!(error instanceof AuthStoreError)) throw error;
+          // A committed approval remains an approval even if storage is busy.
+          try { current = outcome((await store.read()).requests.find(row => row.id === saved.requestId)); } catch {}
+          current = { ...current, diagnostic: { code: 'STORE_UNAVAILABLE', credentialsSupplied: current.status === 'authenticating' } };
+        }
+        if (current.status !== 'approved' || current.diagnostic?.code !== 'STORE_UNAVAILABLE') break;
+        if (attempt === 0 && !waitsClosing) await delay(50);
+        if (waitsClosing) break;
+      }
+      return current;
+    })();
+    executionOutcomes.add(work);
+    work.then(() => executionOutcomes.delete(work), () => executionOutcomes.delete(work));
     if (waitForExecution) return work;
     work.catch(() => {});
     return saved;
@@ -539,7 +557,15 @@ function invalidatePolicy(state, policy, time, approverId) {
             ...(enrollment?.catalog ? { catalog: enrollment.catalog, sessionHandoff: true } : {}) };
         });
         // Include owner-facing metadata before enforcing the encrypted page size.
-        return { ...pageItems(items, options, 'requests', (row) => row.requestId), openCount: items.length };
+        const pendingSummary = [];
+        for (const row of state.requests.filter(row => row.status === 'pending').sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id)).slice(0, 20)) {
+          const enrollment = state.enrollments.find(item => item.serviceId === row.serviceId);
+          const summary = { requestId: row.id, name: enrollment?.name || row.serviceId, origin: row.session.origin, expiresAt: row.expiresAt };
+          if (Buffer.byteLength(JSON.stringify([...pendingSummary, summary])) > 8192) break;
+          pendingSummary.push(summary);
+        }
+        return { ...pageItems(items, options, 'requests', (row) => row.requestId),
+          openCount: items.filter(row => ['pending', 'needs-user', 'failed'].includes(row.status)).length, pendingSummary };
       });
     },
 
@@ -624,7 +650,7 @@ function invalidatePolicy(state, policy, time, approverId) {
       if (!previous) return outcome(null);
       if (requesterRevoked(state, previous.requesterId)) return { status: 'failed', reason: 'requester-revoked' };
       if (previous.supersededBy) return outcome(state.requests.find((row) => row.id === previous.supersededBy));
-      if (!RETRYABLE.has(previous.status)) return { status: 'failed', reason: 'request-not-retryable' };
+      if (!retryable(previous, now())) return { status: 'failed', reason: 'request-not-retryable' };
       if (running.has(id)) return { status: 'failed', reason: 'authentication-active' };
       const enrollment = state.enrollments.find((row) => row.serviceId === previous.serviceId);
       if (!enrollment || enrollment.version !== previous.enrollmentVersion || enrollment.accountId !== previous.accountId ||
@@ -648,7 +674,7 @@ function invalidatePolicy(state, policy, time, approverId) {
         if (!row) return outcome(null);
         if (requesterRevoked(current, row.requesterId)) return { status: 'failed', reason: 'requester-revoked' };
         if (row.supersededBy) return outcome(current.requests.find((item) => item.id === row.supersededBy));
-        if (!RETRYABLE.has(row.status)) return { status: 'failed', reason: 'request-not-retryable' };
+        if (!retryable(row, now())) return { status: 'failed', reason: 'request-not-retryable' };
         if (running.has(id)) return { status: 'failed', reason: 'authentication-active' };
         const enrolled = current.enrollments.find((item) => item.serviceId === enrollment.serviceId);
         if (enrolled?.version !== enrollment.version) return { status: 'failed', reason: 'enrollment-changed' };
@@ -835,7 +861,9 @@ function invalidatePolicy(state, policy, time, approverId) {
           audit(state, 'policy-revoked', null, now(), approverId, { policyId: policy.id, reason: 'provider-removed' });
         }
         for (const row of state.requests) if (ids.has(row.serviceId) && needsAttention(row)) {
-          requestIds.push(row.id); setState(state, row, 'cancelled', 'provider-removed', now(), approverId);
+          requestIds.push(row.id);
+          if (row.status === 'authenticating' || row.diagnostic?.credentialsSupplied === true) setState(state, row, 'needs-user', 'authentication-uncertain', now(), approverId);
+          else setState(state, row, 'cancelled', 'provider-removed', now(), approverId);
         }
         state.enrollments = state.enrollments.filter(row => !ids.has(row.serviceId));
         return { serviceIds, requestIds };
@@ -848,7 +876,7 @@ function invalidatePolicy(state, policy, time, approverId) {
     async resume() {
       await initialize();
       const state = await store.read();
-      return Promise.all(state.requests.filter((row) => row.status === 'approved').map((row) => execute(row.id)));
+      return Promise.allSettled(state.requests.filter((row) => row.status === 'approved').map((row) => executionOutcome(outcome(row), true)));
     },
 
     async drain({ abort = false } = {}) {
@@ -857,6 +885,7 @@ function invalidatePolicy(state, policy, time, approverId) {
         await Promise.allSettled([...waiters.values()].flatMap(entries => [...entries].map(entry => entry.stop())));
         abortRequests([...running.keys()]);
       }
+      await Promise.allSettled([...executionOutcomes]);
       while (running.size) await Promise.allSettled([...running.values()]);
     },
   };

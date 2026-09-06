@@ -325,7 +325,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
         const id = checkName(args.providerId || 'default');
         if (changingProviders.has(id)) return providerFailure(id, { code: 'capacity' });
         changingProviders.add(id);
-        let stage = 'validation';
+        let stage = 'validation', grantsRetired = false;
         try {
           // Validation uses a private candidate. A rejected or timed-out SDK call
           // cannot replace the saved credential or activate a client later.
@@ -334,6 +334,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
           const previous = (await getSecrets()).providers[id];
           if (previous && !previous.token) {
             const retired = await broker.retireProvider(id, principal.id);
+            grantsRetired = true;
             const cleanup = await Promise.allSettled(retired.flatMap(serviceId => [
               Promise.resolve().then(() => controller.removeService(serviceId)),
               Promise.resolve().then(() => passkeys?.releaseService(serviceId)),
@@ -357,7 +358,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
           // Persistence can fail after committing. Invalidate the old client so
           // future use reloads storage instead of assuming which token won.
           if (stage === 'storage') { discoveryEpoch++; providers.onepassword?.reset?.(id); }
-          return providerFailure(id, error, stage);
+          return { ...await providerFailure(id, error, stage), ...(grantsRetired ? { reason: 'grants-retired' } : {}) };
         } finally { changingProviders.delete(id); }
       }
       case 'providers': return Object.entries((await getSecrets()).providers).map(([id, record]) => providerSummary(id, record));
@@ -389,7 +390,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
           const record = (await getSecrets()).providers[id];
           if (!record || record.token || record.discoveryEnabled !== false) throw new Error('Credential removal unconfirmed');
           dropped = true;
-          discoveryEpoch++; providers.onepassword.reset(id);
+          discoveryEpoch++; providers.onepassword?.reset?.(id);
           const services = await broker.retireProvider(id, principal.id);
           const cleanup = await Promise.allSettled(services.flatMap(serviceId => [
             Promise.resolve().then(() => controller.removeService(serviceId)),

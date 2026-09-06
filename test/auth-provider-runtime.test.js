@@ -289,3 +289,24 @@ test('a failed durable retirement blocks token replacement until old grants are 
   assert.equal((await f.runtime.store.read()).enrollments.length, 0);
   assert((await f.runtime.store.read()).policies.every(row => row.revokedAt));
 });
+
+test('replacement reports retired grants when credential persistence fails', async t => {
+  const f = await fixture(t);
+  f.secrets.providers.default = { discoveryEnabled: false };
+  f.control.persistFail = true;
+  const result = await f.dispatch('provider.put', { providerId: 'default', token: TOKEN });
+  assert.equal(result.status, 'failed'); assert.equal(result.reason, 'grants-retired'); safe(result);
+});
+
+test('provider removal works without an optional provider adapter', async t => {
+  const state = { requests: [], enrollments: [], policies: [], audit: [] };
+  const identity = createIdentity('executor'), owner = publicIdentity(createIdentity('approver'));
+  const secrets = { identity, providers: { default: { token: TOKEN } }, peers: [{ identity: owner, enabled: true }] };
+  const runtime = await createAuthExecutor({ home: '/tmp/chromesync-no-provider-fixture', secrets, loadSecrets: async () => secrets,
+    providers: {}, store: { read: async () => state, mutate: async fn => fn(state) },
+    controller: { inspectSession() {}, withAuthenticationLease() {}, close() {} },
+    persistProvider: async id => { secrets.providers[id] = { discoveryEnabled: false }; } });
+  t.after(() => runtime.close());
+  const result = await runtime.dispatch('provider.remove', { providerId: 'default' }, owner);
+  assert.notEqual(result.status, 'failed'); assert.equal(result.provider.hasCredential, false);
+});

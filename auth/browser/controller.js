@@ -386,7 +386,7 @@ export function createBrowserController({chromePath, profileRoot, services = [],
   const reaper = setInterval(() => {
     const cutoff = Date.now() - idleTimeoutMs;
     const idle = [...sessions.values()].filter(session => !session.lease && !session.activeOperation && session.lastActivityAt <= cutoff);
-    closeAll(idle).catch(() => {});
+    closeAll([...idle, ...closingSessions.values()]).catch(() => {});
   }, Math.min(30000, Math.max(10, idleTimeoutMs)));
   reaper.unref();
 

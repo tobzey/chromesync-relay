@@ -97,3 +97,14 @@ test('failed startup cleanup retains its capacity reservation until close succee
   await controller.close();
   assert.equal(closes, 2);
 });
+
+test('idle reaper retries failed closes and releases the reserved slot', async t => {
+  let closes = 0;
+  const controller = createBrowserController({ profileRoot: '/tmp/chromesync-reaper-retry', services: [service], idleTimeoutMs: 30, maxSessions: 1,
+    launchBrowser: async () => fakeBrowser(async () => { if (++closes === 1) throw Object.assign(new Error('Synthetic close failure'), { code: 'BROWSER_CLOSE_FAILED' }); }) });
+  t.after(() => controller.close());
+  await controller.openSession('example', 'agent');
+  for (let i = 0; i < 100 && closes < 2; i++) await delay(10);
+  assert.equal(closes, 2);
+  assert.ok((await controller.openSession('example', 'agent')).id);
+});

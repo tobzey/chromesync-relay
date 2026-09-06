@@ -30,7 +30,7 @@ test('consume diagnostics preserve only safe codes and supply state while connec
   const provider = createOnePasswordProvider({ loadToken: async () => 'synthetic', loadSdk: async () => ({ createClient: async () => ({ secrets: { resolve: async () => 'synthetic' } }) }) });
   for (const supplied of [true, false]) {
     const result = await provider.useFactors(enrollment, ['password'], () => { throw Object.assign(new Error('SECRET-SENTINEL'), { code: 'BROWSER_CLOSED', credentialsSupplied: supplied }); });
-    assert.deepEqual(result, { status: 'failed', reason: 'BROWSER_CLOSED', credentialsSupplied: supplied });
+    assert.deepEqual(result, { status: 'failed', reason: 'BROWSER_CLOSED', credentialsSupplied: true });
     assert(!JSON.stringify(result).includes('SECRET-SENTINEL'));
   }
   const bad = createOnePasswordProvider({ loadToken: async () => 'synthetic', loadSdk: async () => ({ createClient: async () => { throw new Error('invalid service account token, SECRET-SENTINEL'); } }) });
@@ -39,4 +39,34 @@ test('consume diagnostics preserve only safe codes and supply state while connec
   assert(!JSON.stringify(bad.diagnostics('default')).includes('SECRET-SENTINEL'));
   const missing = createOnePasswordProvider({ loadToken: async () => '' });
   assert.equal((await missing.useFactors(enrollment, ['password'], () => {})).reason, 'credential-missing');
+  assert.equal(missing.diagnostics('default').code, 'credential-missing');
+});
+
+test('sink errors default to supplied and unknown codes are masked', async () => {
+  const provider = createOnePasswordProvider({ loadToken: async () => 'synthetic', loadSdk: async () => ({ createClient: async () => ({ secrets: { resolve: async () => 'synthetic' } }) }) });
+  const result = await provider.useFactors(enrollment, ['password'], () => { throw Object.assign(new Error('private'), { code: 'SECRET_SENTINEL' }); });
+  assert.deepEqual(result, { status: 'failed', reason: 'FILL_FAILED', credentialsSupplied: true });
+});
+
+test('a retired credential lease cannot overwrite fresh provider health', async () => {
+  let release, entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  const provider = createOnePasswordProvider({ loadToken: async () => 'synthetic', loadSdk: async () => ({ createClient: async () => ({ secrets: { resolve: async () => { entered(); await gate; throw new Error('private'); } } }) }) });
+  const work = provider.useFactors(enrollment, ['password'], () => {});
+  await started; provider.reset('default'); release(); await work;
+  assert.deepEqual(provider.diagnostics('default'), { status: 'unchecked' });
+});
+
+for (const reset of [false, true]) test(`late TOTP failure records health only for its current generation (reset=${reset})`, async () => {
+  let release, entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  const provider = createOnePasswordProvider({ now: () => 10000, loadToken: async () => 'synthetic', loadSdk: async () => ({ createClient: async () => ({ secrets: { resolve: async () => { entered(); await gate; throw new Error('private'); } } }) }) });
+  const work = provider.useFactors(enrollment, ['totp'], credentials => credentials.totp());
+  await started; if (reset) provider.reset('default'); release();
+  const result = await work;
+  assert.equal(result.credentialsSupplied, true); assert.equal(result.reason, 'CREDENTIALS_UNAVAILABLE');
+  if (reset) assert.deepEqual(provider.diagnostics('default'), { status: 'unchecked' });
+  else assert.equal(provider.diagnostics('default').code, 'credentials-unavailable');
 });

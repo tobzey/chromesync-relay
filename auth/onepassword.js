@@ -1,9 +1,11 @@
+import { diagnosticCode } from './diagnostic-codes.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createOnePasswordCatalog } from './onepassword-catalog.js';
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const STATUSES = new Set(['authenticated', 'needs-user', 'failed']);
 const CONNECTION_MESSAGES = Object.freeze({
+  'credential-missing': 'No credential is stored for this connection.',
   'sdk-unavailable': 'The 1Password SDK is unavailable on the executor. Install its authentication dependencies and retry.',
   'sdk-invalid': 'The executor has an incompatible 1Password SDK installation. Reinstall its authentication dependencies.',
   'auth-invalid': 'The service account token is incomplete or invalid. Paste the complete token without spaces or line breaks.',
@@ -181,8 +183,10 @@ export function createOnePasswordProvider({ loadToken, loadSdk = () => import('@
     searchAccounts: catalog.searchAccounts,
     resolveAccount: catalog.resolveAccount,
     async useFactors(enrollment, factors, consume, { signal } = {}) {
-      let credentials = {}, active = true;
+      let credentials = {}, active = true, sinkInvoked = false;
       const providerId = enrollment.providerId || 'default';
+      const version = versions.get(providerId) ?? 0;
+      const recordCurrent = update => { if ((versions.get(providerId) ?? 0) === version) record(providerId, update); };
       try {
         validateOnePasswordEnrollment(enrollment);
         if (signal?.aborted) return { status: 'needs-user' };
@@ -211,17 +215,23 @@ export function createOnePasswordProvider({ loadToken, loadSdk = () => import('@
           };
         }
         let result;
-        try { result = await consume(credentials); }
-        catch (error) { if (error?.name === 'AuthStoreError') throw error; return { status: signal?.aborted ? 'needs-user' : 'failed', reason: /^[A-Z_]{1,80}$/.test(error?.code || '') ? error.code : 'FILL_FAILED', credentialsSupplied: error?.credentialsSupplied === true }; }
+        try { sinkInvoked = true; result = await consume(credentials); }
+        catch (error) {
+          if (error?.name === 'AuthStoreError') throw error;
+          if (error instanceof OnePasswordConnectionError) recordCurrent(error.diagnostic);
+          return { status: signal?.aborted ? 'needs-user' : 'failed', reason: diagnosticCode(error?.code) || 'FILL_FAILED', credentialsSupplied: sinkInvoked };
+        }
         const status = result === true ? 'authenticated' : result?.status;
         return { status: STATUSES.has(status) ? status : 'failed',
-          ...(typeof result?.reason === 'string' && /^[A-Z_]{1,80}$/.test(result.reason) ? { reason: result.reason } : {}),
+          ...(diagnosticCode(result?.reason) ? { reason: diagnosticCode(result.reason) } : {}),
           ...(typeof result?.credentialsSupplied === 'boolean' ? { credentialsSupplied: result.credentialsSupplied } : {}) };
       } catch (error) {
         if (error?.name === 'AuthStoreError') throw error;
-        clients.delete(providerId);
-        if (error instanceof OnePasswordConnectionError) { record(providerId, error.diagnostic); return { status: 'unavailable', reason: error.diagnostic.code }; }
-        return { status: 'unavailable', reason: error?.code === 'CREDENTIAL_MISSING' ? 'credential-missing' : 'credentials-unavailable' };
+        if ((versions.get(providerId) ?? 0) === version) clients.delete(providerId);
+        if (error instanceof OnePasswordConnectionError) { recordCurrent(error.diagnostic); return { status: 'unavailable', reason: error.diagnostic.code }; }
+        const reason = error?.code === 'CREDENTIAL_MISSING' ? 'credential-missing' : 'credentials-unavailable';
+        recordCurrent(problem(reason, 'credentials').diagnostic);
+        return { status: 'unavailable', reason };
       } finally {
         active = false;
         for (const key of Object.keys(credentials)) delete credentials[key];

@@ -118,7 +118,7 @@ test('ephemeral observations avoid durable replay markers and recheck live peer 
   const f = transportFixture();
   let calls = 0;
   const executor = createRelayExecutor({ identity: f.executorIdentity, getPeers: () => [f.peer], store: f.store, io: f.io, now: f.now,
-    isReadOnly: (operation) => operation === 'takeover.observe',
+    isReadOnly: (operation) => ['auth.wait', 'takeover.observe', 'passkey.observe'].includes(operation),
     dispatch: async () => ({ status: 'ready', observation: ++calls, image: 'synthetic-pixel'.repeat(6000) }) });
   const command = f.enqueue('takeover.observe');
   await executor.poll(); await executor.drain();
@@ -160,7 +160,7 @@ test('owner reads and denial retain reserved access when the normal journal is s
   f.state.transport = Object.fromEntries(Array.from({ length: 2000 }, () => [`${f.agent.id}:${newId()}`, { status: 'rejected', expiresAt: f.now() + 120000 }]));
   const calls = [];
   const executor = createRelayExecutor({ identity: f.executorIdentity, getPeers: () => [f.peer], store: f.store, io: f.io, now: f.now,
-    isReadOnly: (operation) => operation === 'requests', dispatch: async (operation) => {
+    isReadOnly: (operation) => ['requests', 'auth.wait', 'takeover.observe', 'passkey.observe'].includes(operation), dispatch: async (operation) => {
       calls.push(operation);
       return operation === 'requests' ? { items: [], nextCursor: null, hasMore: false } : { status: 'denied' };
     } });
@@ -225,7 +225,7 @@ test('stale sweep preserves future timestamps and counts rejected envelopes with
   const old = f.enqueue('requests'), future = f.enqueue('requests');
   f.blobs.set(future.name, Buffer.from('SECRET-SENTINEL'));
   const executor = createRelayExecutor({ identity: f.executorIdentity, getPeers: async () => [f.peer], store: f.store, now: f.now, dispatch: async () => ({}),
-    io: { ...f.io, list: async () => [{ name: old.name, mtime: f.now() - 240001 }, { name: future.name, mtime: f.now() + 1000000 }] } });
+    io: { ...f.io, list: async () => [{ name: old.name, mtime: f.now() - 900001 }, { name: future.name, mtime: f.now() + 1000000 }] } });
   const result = await executor.poll();
   assert.equal(result.rejectedEnvelopes, 1);
   assert(!f.blobs.has(old.name)); assert(f.blobs.has(future.name));
@@ -250,4 +250,40 @@ test('oversized ephemeral response returns response-capacity instead of strandin
   await executor.poll(); await executor.drain();
   assert.equal(f.reply(command.id).result.reason, 'response-capacity');
   assert(!f.blobs.has(command.name));
+});
+
+test('active commands are not fetched again while their held response is pending', async () => {
+  const f = transportFixture(); const command = f.enqueue('auth.wait');
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const executor = createRelayExecutor({ identity: f.executorIdentity, getPeers: () => [f.peer], store: f.store, io: f.io, now: f.now, dispatch: async () => { await gate; return {}; } });
+  try {
+    await executor.poll(); await executor.poll();
+    assert.equal(f.reads.filter(name => name === command.name).length, 1);
+  } finally { release(); await executor.drain(); }
+});
+
+test('capacity remains sticky across a later rate limit', async () => {
+  const f = transportFixture(); let calls = 0;
+  const caller = createRelayCaller({ identity: f.agent, peer: f.executorPeer, io: { ...f.io, push: async () => { throw Object.assign(new Error('Synthetic'), { status: ++calls === 1 ? 507 : 429 }); } }, now: f.now, sleep: async ms => f.advance(ms) });
+  assert.equal((await caller.call('requests', {}, { timeoutMs: 2000 })).reason, 'relay-capacity');
+});
+
+test('executor rejects ephemeral operations classified as mutations at construction', () => {
+  const f = transportFixture();
+  assert.throws(() => createRelayExecutor({ identity: f.executorIdentity, getPeers: () => [f.peer], store: f.store, isReadOnly: () => false }), /read-only/);
+});
+
+test('sweep does not delete four-minute-old or future invalid envelopes', async () => {
+  const f = transportFixture();
+  for (const name of ['recent', 'old', 'future']) f.blobs.set(name, Buffer.from('synthetic-invalid'));
+  const executor = createRelayExecutor({ identity: f.executorIdentity, getPeers: () => [f.peer], store: f.store, now: f.now, dispatch: async () => ({}), io: { ...f.io,
+    list: async () => [{ name: 'recent', mtime: f.now() - 240001 }, { name: 'old', mtime: f.now() - 900001 }, { name: 'future', mtime: f.now() + 1 }] } });
+  await executor.poll(); await executor.drain();
+  assert.deepEqual([...f.blobs.keys()], ['recent', 'future']);
+});
+
+test('custom ephemeral classification cannot include a known mutation', () => {
+  const f = transportFixture();
+  assert.throws(() => createRelayExecutor({ identity: f.executorIdentity, getPeers: () => [f.peer], store: f.store,
+    isEphemeral: operation => operation === 'request.decide' }), /read-only/);
 });
