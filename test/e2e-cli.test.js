@@ -1,3 +1,4 @@
+import { paired, pairReceiver } from './pairing-fixture.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -15,7 +16,8 @@ test('terminal profiles: real Chrome → encrypted relay → Chrome, isolated pr
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chromesync-cli-e2e-'));
   const sourceHome = path.join(root, 'source'), receiverHome = path.join(root, 'receiver');
   const relay = await startRelay({ host: '127.0.0.1', port: 0, dataDir: path.join(root, 'relay'), sweepIntervalMs: 0, log() {} });
-  const p = { name: 'work', role: 'source', secret: 'synthetic-only-pairing-secret-32-chars', sourceHostId: 'aabbccddeeff0011', relayUrl: relay.url, allowlist: [] };
+  const { source: p, receiver: receiverProfile, result } = await paired(null, { sourceHome, receiverHome, relay: relay.url });
+  relay.config.allowedRooms.push(result.roomId);
   const clients = [];
   try {
     for (const home of [sourceHome, receiverHome]) {
@@ -27,7 +29,7 @@ test('terminal profiles: real Chrome → encrypted relay → Chrome, isolated pr
     await source.send('Storage.setCookies', { cookies: [cookie, { ...cookie, name: 'partitioned', partitionKey: { topLevelSite: 'https://example.org', hasCrossSiteAncestor: true } }] });
     await receiver.send('Storage.setCookies', { cookies: [{ name: 'receiver-only', value: 'synthetic-local', url: 'https://test.invalid/' }] });
     assert.equal((await syncProfile(sourceHome, p)).status, 'sent');
-    const receiverProfile = { ...p, role: 'receiver' };
+
     assert.equal((await syncProfile(receiverHome, receiverProfile)).written, 2);
     const received = (await receiver.send('Storage.getCookies')).cookies;
     assert.equal(received.find(c => c.name === cookie.name).value, cookie.value);
@@ -53,7 +55,10 @@ test('terminal profiles: real Chrome → encrypted relay → Chrome, isolated pr
     assert.equal((await receiver.send('Storage.getCookies')).cookies.find(c => c.name === cookie.name).value, cookie.value);
     await receiver.send('Storage.setCookies', { cookies: [{ name: 'receiver-only', value: 'synthetic-local', url: 'https://test.invalid/' }] });
     // A different named profile has its own room identity and never imports this source.
-    assert.equal((await syncProfile(receiverHome, { ...receiverProfile, name: 'personal', sourceHostId: '0000000000000000' })).status, 'waiting-for-source');
+    const personalSource = await createProfile(sourceHome, { name: 'personal', role: 'source', relay: relay.url });
+    const personal = await pairReceiver(sourceHome, personalSource, receiverHome, 'personal');
+    relay.config.allowedRooms.push(personal.result.roomId);
+    assert.equal((await syncProfile(receiverHome, personal.receiver)).status, 'waiting-for-source');
     await source.send('Storage.clearCookies');
     await syncProfile(sourceHome, p);
     assert.equal((await syncProfile(receiverHome, receiverProfile)).deleted, 2);
@@ -63,8 +68,8 @@ test('terminal profiles: real Chrome → encrypted relay → Chrome, isolated pr
     // synthetic chrome.cookies payload goes through the real relay and CDP.
     const extensionSource = await createProfile(sourceHome, { name: 'everyday', role: 'source', source: 'extension', relay: relay.url });
     const inviteFile = path.join(root, 'everyday.invite.json');
-    createInvite(extensionSource, inviteFile);
-    const extensionReceiver = await createProfile(receiverHome, { name: 'everyday', 'invite-file': inviteFile });
+    const { receiver: extensionReceiver, result: extensionPair } = await pairReceiver(sourceHome, extensionSource, receiverHome, 'everyday');
+    relay.config.allowedRooms.push(extensionPair.roomId);
     await openProfile(receiverHome, 'everyday', { headless: true });
     const extensionClient = (await connectProfile(receiverHome, 'everyday')).client;
     clients.push(extensionClient);

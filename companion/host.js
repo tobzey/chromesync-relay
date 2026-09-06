@@ -42,40 +42,9 @@ function readMessages(onMessage) {
 }
 
 const cmd = process.argv[2];
-if (cmd === "import-drop") {
-  const env = process.env;
-  const res = await handleNativeMessage(
-    {
-      type: "importDrop",
-      dropDir: env.CHROMESYNC_DROP_DIR,
-      pairingSecret: env.CHROMESYNC_PAIRING_SECRET,
-      userDataDir: env.CHROMESYNC_USER_DATA_DIR,
-      port: Number(env.CHROMESYNC_PORT) || 0,
-      statePath: env.CHROMESYNC_STATE_PATH || "",
-      maxAgeMs: env.CHROMESYNC_MAX_AGE_MS ? Number(env.CHROMESYNC_MAX_AGE_MS) : undefined,
-    },
-    { env },
-  );
-  // Counts + generic errors only — never cookie values or the pairing secret.
-  process.stdout.write(JSON.stringify({ ok: res.ok, imported: res.imported, written: res.written, skipped: res.skipped, errors: res.errors }) + "\n");
-  process.exit(res.ok ? 0 : 1);
-} else if (cmd === "relay-pull") {
-  const env = process.env;
-  const res = await handleNativeMessage(
-    {
-      type: "relayPull",
-      relayUrl: env.CHROMESYNC_RELAY_URL,
-      pairingSecret: env.CHROMESYNC_PAIRING_SECRET,
-      userDataDir: env.CHROMESYNC_USER_DATA_DIR,
-      port: Number(env.CHROMESYNC_PORT) || 0,
-      statePath: env.CHROMESYNC_STATE_PATH || "",
-      maxAgeMs: env.CHROMESYNC_MAX_AGE_MS ? Number(env.CHROMESYNC_MAX_AGE_MS) : undefined,
-    },
-    { env },
-  );
-  // Counts + generic errors only — never cookie values or the pairing secret.
-  process.stdout.write(JSON.stringify({ ok: res.ok, imported: res.imported, written: res.written, skipped: res.skipped, errors: res.errors }) + "\n");
-  process.exit(res.ok ? 0 : 1);
+if (cmd === "import-drop" || cmd === "relay-pull") {
+  process.stdout.write(JSON.stringify({ ok: false, error: 'Legacy shared-secret transport disabled; use terminal v2 pairing' }) + "\n");
+  process.exit(1);
 } else {
   readMessages(async (msg) => {
     const res = await handleNativeMessage(msg);

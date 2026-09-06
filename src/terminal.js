@@ -24,5 +24,5 @@ export async function syncTerminal(binding, { collect = collectTerminalCookies, 
   const cookies = await collect();
   const result = await send({ type: 'terminalPush', name: binding.name, instanceId: binding.instanceId, cookies });
   return { at: Date.now(), collected: cookies.length, mappingSkipped: 0,
-    sinks: { [binding.name]: { ok: true, written: result.written || 0, skipped: 0, errors: [] } } };
+    sinks: { [binding.name]: { ok: result.status !== 'partial', written: result.written || 0, skipped: 0, errors: result.status === 'partial' ? ['Some receiver channels could not be updated'] : [] } } };
 }

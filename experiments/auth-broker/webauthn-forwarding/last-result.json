@@ -1,0 +1,30 @@
+{
+  "timestamp": "2026-09-06T10:41:59.382Z",
+  "result": "PASS",
+  "browser": "Chrome/152.0.7977.76",
+  "fixture": "Two isolated Chrome processes; virtual authenticator with generated synthetic EC key; localhost origin",
+  "checks": {
+    "origin": "http://localhost:54623",
+    "type": "webauthn.get",
+    "rpId": "localhost",
+    "userPresent": true,
+    "userVerified": true,
+    "signatureValid": true,
+    "signatureCounter": 1
+  },
+  "originalCredentialRequestWasPending": true,
+  "originalSessionAuthenticated": true,
+  "receiverSessionAuthenticated": false,
+  "independentServerSessions": 2,
+  "receiverSessionSubmissionStatus": 403,
+  "replayStatus": 409,
+  "cookiesCopied": false,
+  "existingProfilesAccessed": false,
+  "realVaultAccessed": false,
+  "limitations": [
+    "Remote fixture shim holds navigator.credentials.get pending; chrome.webAuthenticationProxy extension integration is not tested.",
+    "Actual 1Password extension/native provider and real user verification are not tested.",
+    "Virtual authenticator simulates user presence and user verification; passing UV checks validates transport only.",
+    "Top-level localhost origin only; production HTTPS, iframes, cancellation, timeouts, multiple accounts, and WebAuthn extensions remain to test."
+  ]
+}

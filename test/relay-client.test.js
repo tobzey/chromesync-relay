@@ -37,6 +37,7 @@ function assertNoLeak(text) {
 async function withRelay(fn) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "chromesync-relay-"));
   const relay = await startRelay({
+    allowedRooms: [deriveRelayAuth(SECRET).roomId],
     host: "127.0.0.1",
     port: 0,
     dataDir,

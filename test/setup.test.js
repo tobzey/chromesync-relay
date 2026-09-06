@@ -1,3 +1,4 @@
+import { pairReceiver } from './pairing-fixture.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -30,8 +31,9 @@ test('wizard completes source setup, launch, first sync, invitation and service'
   const profile = loadConfig(dir).profiles[0];
   assert.equal(profile.sourceMode, 'managed');
   const invite = JSON.parse(fs.readFileSync(path.join(dir, 'invites/work.invite.json')));
-  assert.equal(invite.secret, profile.secret);
-  assert.ok(!output.join('\n').includes(profile.secret));
+  assert.equal(invite.version, 2);
+  assert.equal(invite.secret, undefined);
+  assert.ok(!output.join('\n').includes('privateKey'));
 });
 
 test('wizard uses existing Chrome without launching another browser or source daemon', async t => {
@@ -44,21 +46,15 @@ test('wizard uses existing Chrome without launching another browser or source da
   assert.equal(answers.length, 0);
 });
 
-test('receiver wizard imports an invitation, launches headlessly and can resume setup', async t => {
+test('receiver wizard creates an approval request and stops before browser access', async t => {
   const sender = home(t), receiver = home(t);
   const p = await createProfile(sender, { name: 'work', role: 'source', relay: 'https://relay.example.com' });
   const file = path.join(sender, 'work.invite.json');
-  createInvite(p, file);
-  const answers = ['agent', 'receiver', file, '', '', '', 'n'];
-  let opened;
-  await runWizard(receiver, { ask: questions(answers), say() {}, probe: async () => {}, open: async (name, headless) => { opened = { name, headless }; },
-    sync: async () => ({ status: 'waiting-for-source' }), service: async () => {} });
-  assert.deepEqual(opened, { name: 'agent', headless: true });
-  assert.equal(loadConfig(receiver).profiles[0].secret, p.secret);
-  const resume = ['existing', 'agent', 'n', 'n', 'n'];
-  await runWizard(receiver, { ask: questions(resume), say() {}, probe: async () => {} });
-  assert.equal(loadConfig(receiver).profiles.length, 1);
-  assert.equal(resume.length, 0);
+  await createInvite(p, file, { home: sender });
+  const answers = ['agent', 'receiver', file, 'n'];
+  await runWizard(receiver, { ask: questions(answers), say() {}, open: async () => assert.fail('pending approval') });
+  assert.equal(loadConfig(receiver).profiles[0].pending, true);
+  assert.equal(fs.existsSync(file), false);
 });
 
 test('automatic native registration uses the manifest identity and quotes paths', async t => {

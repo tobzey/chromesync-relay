@@ -1,5 +1,5 @@
 name: Tests
-on: [push, pull_request]
+on: [push, pull_request, workflow_call]
 permissions:
   contents: read
 jobs:
@@ -11,12 +11,25 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         node: [22, 24]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: ${{ matrix.node }}
       - run: npm ci --ignore-scripts
       - name: Require Chrome for browser integration tests
         run: node --input-type=module -e "import {resolveChromePath} from './companion/host-core.js'; if (!resolveChromePath()) process.exit(1)"
-      - run: npm test
+      - name: Install Linux credential test dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsecret-tools python3-secretstorage gnome-keyring dbus-x11
+      - name: Test macOS
+        if: runner.os == 'macOS'
+        run: npm test
+      - name: Test Linux with an isolated Secret Service
+        if: runner.os == 'Linux'
+        run: dbus-run-session -- sh -c 'printf "synthetic-test-only" | gnome-keyring-daemon --unlock --components=secrets; npm test'
+      - name: Reproduce archives
+        run: |
+          python3 scripts/build-release.py "$RUNNER_TEMP/a"
+          python3 scripts/build-release.py "$RUNNER_TEMP/b"
+          diff -r "$RUNNER_TEMP/a" "$RUNNER_TEMP/b"
       - run: npm pack --dry-run

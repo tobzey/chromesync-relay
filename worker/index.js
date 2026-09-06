@@ -1,3 +1,5 @@
+import { auditQuota } from './monitor.js';
+import { admitted } from '../server/admission.js';
 // ChromeSync relay: Cloudflare Worker. Opaque E2E ciphertext only.
 // Web-platform APIs (Request/Response, crypto.subtle). No node: imports.
 // Never logs tokens, secrets, headers, or blob bodies.
@@ -32,6 +34,7 @@ function respond(status, body = STATUS_TEXT[status] || "", type = "text/plain", 
 }
 
 function logLine(log, { method, roomId, name, status, size }) {
+  if ([403, 429, 507].includes(status)) log(JSON.stringify({ event: 'relay-security-alert', status, reason: status === 507 ? 'quota' : status === 429 ? 'rate-limit' : 'admission', roomId: roomId || null }));
   log(`${method} ${roomId || "-"} ${name || "-"} ${status} ${size ?? 0}`);
 }
 
@@ -150,6 +153,9 @@ async function handleRequest(request, { config, ipLimiter, roomLimiter, log, buc
       return res;
     }
 
+    if (!admitted(config, roomId)) {
+      logLine(log, { method, roomId, name, status: 403, size: 0 }); return respond(403);
+    }
     if (!roomLimiter.take(roomId)) {
       const res = respond(429, STATUS_TEXT[429], "text/plain", { "Retry-After": "1" });
       logLine(log, { method, roomId, name, status: 429, size: 0 });
@@ -251,15 +257,12 @@ export function createHandler(overrides = {}) {
   };
 }
 
-let defaultHandler;
-
+const handlers = new WeakMap();
+// Configuration must be read from the current env, never cached across deployments.
 export default {
+  async scheduled(controller, env, ctx) { ctx.waitUntil(auditQuota(env)); },
   async fetch(request, env, ctx) {
-    if (!defaultHandler) {
-      defaultHandler = createHandler({
-        config: configFromEnv(env),
-      });
-    }
-    return defaultHandler(request, env, ctx);
+    if (!handlers.has(env)) handlers.set(env, createHandler({ config: configFromEnv(env) }));
+    return handlers.get(env)(request, env, ctx);
   },
 };

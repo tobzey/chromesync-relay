@@ -1,3 +1,4 @@
+import { allowedRooms } from '../server/admission.js';
 // Env parsing for the relay. Safe defaults; no hostnames baked in.
 
 import os from "node:os";
@@ -19,6 +20,7 @@ function boolEnv(env, key, fallback = false) {
 
 export function loadConfig(env = process.env) {
   return {
+    allowedRooms: allowedRooms(env.ALLOWED_ROOMS),
     host: env.HOST || "127.0.0.1",
     port: intEnv(env, "PORT", 8787),
     dataDir: env.DATA_DIR || path.join(os.tmpdir(), "chromesync-relay"),

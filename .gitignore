@@ -26,3 +26,7 @@ coverage/
 
 # Local publication artifacts; never nest a Git history in the source release
 .release/
+
+dist/
+*.request.json
+*.activation.json

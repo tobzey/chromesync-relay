@@ -1,3 +1,4 @@
+import { pairReceiver } from './pairing-fixture.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -17,19 +18,17 @@ test('extension source → shared CLI invitation → receiver, including deletio
   const deps = { home, push: async ({ name, blob }) => blobs.set(name, blob) };
   const profiles = await terminalMessage({ type: 'terminalProfiles' }, deps);
   assert.deepEqual(profiles, { ok: true, profiles: [{ name: 'work', domains: ['example.com'] }] });
-  assert.ok(!JSON.stringify(profiles).includes(p.secret));
+  assert.ok(!JSON.stringify(profiles).includes('privateKey'));
   const message = { type: 'terminalPush', name: p.name, instanceId, cookies: [{ name: 'session', value: 'synthetic-terminal-cookie', domain: 'example.com', path: '/', hostOnly: true, secure: true, httpOnly: true, sameSite: 'lax', session: true },
     { name: 'excluded', value: 'synthetic-excluded', domain: 'example.org' }] };
   await assert.rejects(terminalMessage(message, deps), /Connect/);
   await terminalMessage({ ...message, type: 'terminalBind' }, deps);
   await assert.rejects(terminalMessage({ ...message, instanceId: 'cd'.repeat(16), type: 'terminalBind' }, deps), /already connected/);
+  const receiverHome = path.join(home, 'receiver');
+  const { receiver } = await pairReceiver(home, p, receiverHome, 'agent');
   const sent = await terminalMessage(message, deps);
   assert.equal(sent.written, 1);
   assert.ok(![...blobs.values()][0].includes(Buffer.from('synthetic-terminal-cookie')));
-  const invite = path.join(home, 'invite.json');
-  createInvite(p, invite);
-  const receiverHome = path.join(home, 'receiver');
-  const receiver = await createProfile(receiverHome, { name: 'agent', 'invite-file': invite });
   const calls = [];
   const client = { close() {}, async send(method, params) {
     calls.push({ method, params });

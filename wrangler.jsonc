@@ -5,7 +5,10 @@
   "compatibility_date": "2026-09-05",
   "workers_dev": true,
   "r2_buckets": [
-    { "binding": "BLOBS", "bucket_name": "chromesync-relay" }
+    {
+      "binding": "BLOBS",
+      "bucket_name": "chromesync-relay"
+    }
   ],
   "vars": {
     "MAX_BODY_BYTES": "1048576",
@@ -16,7 +19,22 @@
     "RATE_IP_CAPACITY": "60",
     "RATE_IP_REFILL": "1",
     "RATE_ROOM_CAPACITY": "120",
-    "RATE_ROOM_REFILL": "2"
+    "RATE_ROOM_REFILL": "2",
+    "ALLOWED_ROOMS": "",
+    "ALERT_STORAGE_BYTES": "104857600"
   },
-  "observability": { "enabled": true, "head_sampling_rate": 0.1 }
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "triggers": {
+    "crons": [
+      "17 * * * *"
+    ]
+  },
+  "tail_consumers": [
+    {
+      "service": "chromesync-alerts"
+    }
+  ]
 }

@@ -2,8 +2,8 @@
 
 Use Node.js 22+ and Chrome or Chromium on macOS or Linux. There are no third-party runtime packages, transpilation steps or npm
 post-install scripts. The standalone `install.sh` is the user-invoked installer.
-Its tests use local download fixtures and a pseudo-terminal, never live installs.
-Install Python 3 to run the pseudo-terminal test (it is available on CI).
+Installer tests use temporary repositories with synthetic SSH signing keys, never live installs.
+Install Python 3 for deterministic archive tests; Apple Command Line Tools for macOS credential tests. Linux requires python3-secretstorage and an unlocked Secret Service (see CI).
 
 ```sh
 npm ci --ignore-scripts
@@ -22,7 +22,7 @@ how you verified it, and any compatibility changes. Changes to cookie handling,
 pairing, replay protection and relay storage need meaningful regression tests.
 Keep output free of cookie values and keys, and maintain the CLI's `--json` mode.
 Do not add telemetry or npm lifecycle downloads. Keep the explicit shell installer
-limited to the project repository and verified official Node.js distributions.
+limited to independently trusted SSH-signed project commits. There is no unsigned Node bootstrap.
 
 For private vulnerability reports, see [SECURITY.md](SECURITY.md). For ordinary
 bugs, open a GitHub issue with your OS, Node/Chrome versions, command, and redacted

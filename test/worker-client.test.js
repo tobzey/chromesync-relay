@@ -56,7 +56,7 @@ function startBridge(handler) {
 async function withBridge(fn) {
   const bucket = new MemoryR2Bucket();
   const handler = createHandler({
-    config: { rateIpCapacity: 10_000, rateRoomCapacity: 10_000 },
+    config: { allowedRooms: [deriveRelayAuth(SECRET).roomId], rateIpCapacity: 10_000, rateRoomCapacity: 10_000 },
     log: () => {},
     bucket,
   });

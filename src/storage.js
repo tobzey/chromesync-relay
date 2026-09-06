@@ -48,36 +48,25 @@ export async function getConfig() {
   const { persistLocal = false } = await chrome.storage.local.get("persistLocal");
   const { config } = await area(persistLocal).get("config");
   const merged = deepMerge(structuredClone(DEFAULT_CONFIG), config || {}, { persistLocal });
-  // Relay pairing must survive service-worker restarts even when API keys stay session-only.
-  const { relayPairing } = await chrome.storage.local.get("relayPairing");
-  if (relayPairing && typeof relayPairing === "object") {
-    merged.sinks.relay = { ...merged.sinks.relay, ...relayPairing };
+  // Purge historical secret copies from both storage areas on first access.
+  await chrome.storage.local.remove('relayPairing');
+  for (const target of [chrome.storage.local, chrome.storage.session]) {
+    const stored = await target.get('config');
+    if (stored.config) { scrubLegacy(stored.config); await target.set({ config: stored.config }); }
   }
+  scrubLegacy(merged);
   return merged;
 }
 
 export async function setConfig(config) {
+  config = structuredClone(config);
+  scrubLegacy(config);
   const persistLocal = !!config.persistLocal;
   await chrome.storage.local.set({ persistLocal });
   await area(persistLocal).set({ config });
   // Never leave a stale key in the other area after switching.
   await area(!persistLocal).remove("config");
-  // Always pin relay connection fields locally (not the Browser Use API key).
-  const relay = (config.sinks && config.sinks.relay) || {};
-  if (relay.enabled || relay.relayUrl || relay.pairingSecret) {
-    await chrome.storage.local.set({
-      relayPairing: {
-        enabled: !!relay.enabled,
-        relayUrl: relay.relayUrl || "",
-        pairingSecret: relay.pairingSecret || "",
-        mode: relay.mode || "push",
-        userDataDir: relay.userDataDir || "",
-        port: relay.port || 0,
-      },
-    });
-  } else {
-    await chrome.storage.local.remove("relayPairing");
-  }
+  await chrome.storage.local.remove('relayPairing');
 }
 
 export async function getLastSync() {
@@ -96,4 +85,10 @@ function deepMerge(base, override, extra) {
     out[k] = v && typeof v === "object" && !Array.isArray(v) ? deepMerge(base[k] || {}, v) : v;
   }
   return { ...out, ...extra };
+}
+
+function scrubLegacy(config) {
+  for (const name of ['relay', 'file-drop']) {
+    if (config.sinks?.[name]) { config.sinks[name].pairingSecret = ''; config.sinks[name].enabled = false; }
+  }
 }

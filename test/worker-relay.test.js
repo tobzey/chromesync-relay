@@ -44,7 +44,7 @@ async function call(handler, { method, path, token, body, headers } = {}) {
 function withHandler(extra, fn) {
   const bucket = extra.bucket || new MemoryR2Bucket();
   const handler = createHandler({
-    config: {
+    config: { allowedRooms: [deriveRelayAuth(SECRET).roomId],
       rateIpCapacity: 10_000,
       rateRoomCapacity: 10_000,
       ...(extra.config || {}),
@@ -430,7 +430,7 @@ test("/health ⇒ 200 ok with no auth and with limiter exhausted", async () => {
   });
 });
 
-test("unknown room lists as []", async () => {
+test("unadmitted room is denied", async () => {
   await withHandler({}, async (handler) => {
     const { token, roomId } = auth();
     const listRes = await call(handler, { method: "GET", path: `/rooms/${roomId}/blobs`, token });

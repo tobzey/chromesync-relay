@@ -1,3 +1,4 @@
+import { allowedRooms } from '../server/admission.js';
 // Env parsing for the Worker relay. Same names/defaults as server/config.js
 // for the vars that still apply. wrangler [vars] may arrive as strings.
 
@@ -10,6 +11,7 @@ function num(env, key, fallback) {
 
 export function configFromEnv(env = {}) {
   return {
+    allowedRooms: allowedRooms(env.ALLOWED_ROOMS),
     maxBodyBytes: num(env, "MAX_BODY_BYTES", 1024 * 1024),
     maxBlobsPerRoom: num(env, "MAX_BLOBS_PER_ROOM", 100),
     maxRoomBytes: num(env, "MAX_ROOM_BYTES", 10 * 1024 * 1024),

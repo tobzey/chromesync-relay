@@ -47,7 +47,8 @@ export function validateProfile(p) {
   if (p.sourceMode !== undefined && !['managed', 'extension'].includes(p.sourceMode)) throw new Error('Source must be managed or extension');
   if (p.role === 'receiver' && p.sourceMode === 'extension') throw new Error('Receivers use a managed Chrome profile');
   parseRelayUrl(p.relayUrl);
-  if (typeof p.secret !== 'string' || p.secret.length < 32) throw new Error('A strong pairing secret of at least 32 characters is required');
+  if (p.disabled === true && p.protocol === 1 && p.secret === undefined && /^[a-f0-9]{64}$/.test(p.secretRef)) return p;
+  if (p.secret !== undefined || p.protocol !== 2 || !/^[a-f0-9]{64}$/.test(p.secretRef)) throw new Error('Legacy pairing is disabled. Create a new v2 source and pair each receiver again.');
   if (!/^[a-f0-9]{16}$/.test(p.sourceHostId)) throw new Error('Invalid source identity');
   if (!Array.isArray(p.allowlist) || p.allowlist.some(d => typeof d !== 'string' || !/^(?:[a-z0-9-]+\.)*[a-z0-9-]+$/i.test(d))) throw new Error('Use bare domains in the allowlist');
   return p;

@@ -1,0 +1,111 @@
+name: Authentication integration
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  authentication:
+    name: Auth / ${{ matrix.os }} / Node 22
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux64
+            sha256: 0704631fb3e4f741092e08f55272f90abc3e307f991f05f332924364415b02e0
+          # macos-15 is ARM64 for public and private repositories:
+          # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+          - os: macos-15
+            platform: mac-arm64
+            sha256: 6a12c6e76fcd0dc44accc8d28e93caa44ead57b71b8e0cac891bc3152a709790
+    env:
+      # Stable channel from Google's official CfT manifest, checked 2026-09-06:
+      # https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json
+      # SHA-256 values measured from these exact HTTPS objects and cross-checked
+      # against their Google Cloud Storage object checksums before committing.
+      CFT_VERSION: 152.0.7977.82
+      CFT_PLATFORM: ${{ matrix.platform }}
+      CFT_SHA256: ${{ matrix.sha256 }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Install locked dependencies without lifecycle scripts
+        run: |
+          npm ci --ignore-scripts
+          npm ci --prefix auth --ignore-scripts
+      - name: Install Linux browser dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            apparmor ca-certificates fonts-liberation libasound2t64 \
+            libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
+            libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 \
+            libglib2.0-0t64 libgtk-3-0t64 libnspr4 libnss3 \
+            libpango-1.0-0 libpangocairo-1.0-0 libx11-6 libx11-xcb1 \
+            libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 \
+            libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6 \
+            unzip xauth xdg-utils xvfb
+      - name: Download and verify pinned Chrome for Testing
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --show-error --silent --location --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$RUNNER_TEMP/chromesync-cft.zip" \
+            "https://storage.googleapis.com/chrome-for-testing-public/$CFT_VERSION/$CFT_PLATFORM/chrome-$CFT_PLATFORM.zip"
+          node --input-type=module <<'NODE'
+          import { createReadStream } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          import path from 'node:path';
+          const hash = createHash('sha256');
+          for await (const chunk of createReadStream(path.join(process.env.RUNNER_TEMP, 'chromesync-cft.zip'))) hash.update(chunk);
+          if (hash.digest('hex') !== process.env.CFT_SHA256) throw new Error('Chrome archive SHA-256 mismatch');
+          NODE
+          mkdir -p "$RUNNER_TEMP/chromesync-cft"
+          unzip -q "$RUNNER_TEMP/chromesync-cft.zip" -d "$RUNNER_TEMP/chromesync-cft"
+          if [ "$CFT_PLATFORM" = 'linux64' ]; then
+            browser="$RUNNER_TEMP/chromesync-cft/chrome-linux64/chrome"
+          else
+            browser="$RUNNER_TEMP/chromesync-cft/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+          fi
+          actual_version="$("$browser" --version)"
+          test "$actual_version" = "Google Chrome for Testing $CFT_VERSION"
+          printf 'CHROMESYNC_TEST_CHROME=%s\n' "$browser" >> "$GITHUB_ENV"
+      - name: Permit the verified Linux browser to create its sandbox
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Exact-executable AppArmor exception on this ephemeral CI VM.
+          # Keep Chrome's own sandbox and the system-wide userns restriction.
+          # https://chromium.googlesource.com/chromium/src/+/main/docs/security/apparmor-userns-restrictions.md
+          if [ ! -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ] || \
+             [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = '0' ]; then
+            exit 0
+          fi
+          python3 <<'PY'
+          import os, pathlib
+          executable = os.environ['CHROMESYNC_TEST_CHROME'].replace('\\', '\\\\').replace('"', '\\"')
+          policy = 'abi <abi/4.0>,\ninclude <tunables/global>\nprofile chromesync-cft-ci "' + executable + '" flags=(unconfined) {\n  userns,\n}\n'
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'chromesync-cft-apparmor').write_text(policy)
+          PY
+          sudo install -m 0644 "$RUNNER_TEMP/chromesync-cft-apparmor" /etc/apparmor.d/chromesync-cft-ci
+          sudo apparmor_parser -r /etc/apparmor.d/chromesync-cft-ci
+      - name: Run all authentication tests on Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run -a --server-args='-screen 0 1280x1024x24' node scripts/test-auth-e2e.mjs
+      - name: Run all authentication tests on macOS
+        if: runner.os == 'macOS'
+        run: node scripts/test-auth-e2e.mjs

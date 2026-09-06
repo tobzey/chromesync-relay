@@ -1,3 +1,4 @@
+import { paired } from './pairing-fixture.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -32,7 +33,7 @@ test('OS lock excludes concurrent writers and recovers automatically after a kil
 });
 
 test('source checkpoint survives offline capture and restart, preserves fresh cookies, and does not undo logout', async t => {
-  const home = temp(t), now = Date.now();
+  const { sourceHome: home, source: profile } = await paired(t), now = Date.now();
   let cookies = [cookie], wsUrl = 'browser-one', fail = true, writes = 0;
   const deps = { now, push: async () => { if (fail) throw new Error('offline'); }, connect: async () => ({ wsUrl, client: {
     close() {}, async send(method, params) {

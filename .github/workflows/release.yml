@@ -1,0 +1,46 @@
+name: Reproducible signed release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+  authentication:
+    uses: ./.github/workflows/auth.yml
+  build:
+    needs: [test, authentication]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    environment: release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require trusted source signature
+        env:
+          TRUSTED_SIGNERS: ${{ vars.RELEASE_ALLOWED_SIGNERS }}
+        run: |
+          test -n "$TRUSTED_SIGNERS"
+          printf '%s\n' "$TRUSTED_SIGNERS" > "$RUNNER_TEMP/allowed_signers"
+          git cat-file commit HEAD | sed '/^$/q' | grep -q '^gpgsig -----BEGIN SSH SIGNATURE-----$'
+          git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$RUNNER_TEMP/allowed_signers" verify-commit HEAD
+      - name: Build twice from separate paths and compare
+        run: |
+          python3 scripts/build-release.py "$RUNNER_TEMP/build-a"
+          mkdir "$RUNNER_TEMP/rebuild"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/rebuild"
+          python3 "$RUNNER_TEMP/rebuild/scripts/build-release.py" "$RUNNER_TEMP/build-b"
+          diff -r "$RUNNER_TEMP/build-a" "$RUNNER_TEMP/build-b"
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with:
+          subject-path: ${{ runner.temp }}/build-a/*
+      - name: Publish verified archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP/build-a/"* --verify-tag --generate-notes

@@ -1,231 +1,126 @@
 # ChromeSync
 
-**Your sessions, across your browsers.** Sync cookies from one source Chrome to
-other devices and agent browsers, with separate pairings for work, personal, or
-any other profile. Set it up in your terminal. The Chrome extension is optional.
+ChromeSync sends selected Chrome session cookies to your other devices and agent
+browsers. Each named profile has one source and separately paired receivers.
+Sources can use a managed Chrome window or the optional extension in everyday
+Chrome; receivers use isolated managed Chrome profiles. Cookie changes and
+logouts propagate without deleting unrelated cookies in the receiving browser.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/tobzey/chromesync-relay)
-[MIT license](LICENSE) · [Agent setup](docs/agents.md) · [Security](SECURITY.md)
+**Pairing v2 is a breaking security upgrade.** Keys live in macOS Keychain / Linux
+Secret Service. Receivers have their own revocable channels, source-signed
+snapshots and evolving keys. Invitations expire after 15 minutes and require
+source approval of the receiver's fingerprint. Legacy shared-secret pairing is
+disabled. Existing users: run `chromesync migrate`, then create new v2 pairings.
 
-Self-host the relay with the button above or [run it with Node](server/README.md).
-The relay stores encrypted cookie snapshots; your pairing secret stays on your
-devices. No telemetry, third-party Node packages or cloud subscription to ChromeSync.
-Cloudflare requires an account with R2 enabled; its infrastructure usage may cost money.
+## Install verified source
 
-## Start in the terminal
+Follow [verified installation](docs/install.md). You need Node 22+, Git,
+`ssh-keygen`, Chrome, and an unlocked OS credential store. macOS also needs Apple
+Command Line Tools for the Keychain bridge; Linux needs Python 3 and `python3-secretstorage`.
 
-On **macOS or Linux**, run:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/tobzey/chromesync-relay/main/install.sh | sh
-```
-
-The installer downloads ChromeSync, reuses Node.js 22+ if available or installs a
-private runtime, and opens guided setup. No Git, npm commands, sudo, or extension
-ID to copy. It asks before adding the command to your shell’s PATH.
-
-Setup walks through the entire connection:
-
-1. Name a profile and choose **source** or **receiver**.
-2. On the source, choose a separate ChromeSync browser (no extension) or your
-   existing Chrome profile (optional extension). Enter your relay URL and domains.
-3. Open the source and sign in, or connect the optional extension to the chosen
-   profile. The bridge is registered automatically.
-4. Save a private invitation and import it through the same setup on the receiver.
-5. Check the first sync and optionally enable background syncing after login.
-
-Run `chromesync setup` again to add profiles or finish an interrupted setup.
-Chrome/Chromium must already be installed. The extension needs Chrome 130+.
-See [installer details](docs/install.md) for
-revision pinning, file locations, updates and unattended installation.
-
-You can also use explicit commands without prompts:
-
-**On your source device:**
+After independently verifying a reviewed SSH-signed checkout:
 
 ```sh
-chromesync setup --name work --role source --relay https://YOUR-RELAY.workers.dev
-chromesync open --name work
-# Sign in to the sites you want to share in this Chrome window.
-chromesync pair --name work --output "$HOME/work.invite.json"
-chromesync watch
+CHROMESYNC_REF=REVIEWED_FULL_COMMIT_SHA CHROMESYNC_ALLOWED_SIGNERS=/private/allowed_signers sh install.sh
 ```
 
-Privately transfer the invite file to the receiving device. It grants access to
-this profile's sessions. Do not paste it into an issue, task or chat.
+There is no unsigned or mutable-revision fallback. Never pipe an unverified
+installer into a shell. [Reproducible releases](docs/releasing.md) covers app and
+extension archives, trusted source signatures and build attestations.
 
-**On another device or an agent's machine:**
+## Connect a source and receiver
 
 ```sh
-chromesync setup --name work --invite-file "$HOME/work.invite.json"
-chromesync open --name work --headless
-chromesync watch
+# Source
+chromesync setup --name work --role source --relay https://YOUR-PRIVATE-RELAY --domains example.com
+chromesync pair --name work --output /private/work.invite.json
+# Receiver: import the privately transferred invitation
+chromesync setup --name agent --invite-file /private/work.invite.json --json
 ```
 
-Omit `--headless` for a visible browser. Delete the transferred invite files once
-pairing is complete. Use `chromesync sync` to sync once, or `chromesync status` to
-check progress. The default polling interval is 30 seconds. Unchanged source
-snapshots are refreshed hourly so they stay available through the relay's retention.
-
-Developing from a checkout? Run `npm ci --ignore-scripts` and
-`node cli/index.js setup`; the remote installer is not needed for local development.
-
-## Keep it running
-
-After setup, replace a foreground `watch` process with a user service:
+Receiver setup prints a request path and fingerprint. Transfer its request to
+the source and compare the full fingerprint displayed on the receiver through
+a trusted channel. Finish within the invitation's original 15-minute window:
 
 ```sh
-chromesync service install --launch
-chromesync status
-# To stop and remove the service:
-chromesync service uninstall
+# Source
+chromesync approve --name work --request-file /private/request.json --fingerprint FULL_RECEIVER_FINGERPRINT --output /private/activation.json
+# Receiver: import the activation returned by the source
+chromesync activate --name agent --activation-file /private/activation.json
 ```
 
-The service starts at login through launchd on macOS or systemd on Linux. It
-syncs all configured profiles, including profiles added later. `--launch` keeps
-managed source Chrome open visibly and receiver Chromes open headlessly, including
-after login. Source launching needs a desktop session; Linux user services must
-have the desktop's display environment. Omit `--launch` if you prefer to open
-and close Chrome yourself with `chromesync open`; closed profiles then pause sync.
-Existing-profile extension sources send directly from the extension and need no
-source daemon; the service skips them. Stop the service before closing a managed
-browser you do not want reopened.
-A reboot keeps your profiles, pairings and counters. The service resumes when
-you log in, retries network failures, and restarts if the watcher crashes. Managed
-sources keep encrypted checkpoints of their last observed cookies and restore
-missing session cookies after Chrome restarts. Receivers restore from the relay,
-or their last accepted encrypted checkpoint if it is temporarily offline.
-Recovery snapshots expire after seven days; updates since the last successful
-capture cannot be recovered. A logout observed before shutdown stays logged out.
-Everyday extension sources depend on Chrome's own session retention; select
-**Continue where you left off** in that Chrome profile if you want Chrome to
-retain session cookies across its restarts.
-Sleeping/offline devices cannot exchange new updates; syncing resumes after wake
-and connectivity returns.
-For headless servers, supervise `chromesync watch` with your process manager.
-Shell installations keep stable command paths across updates. Restart an existing
-service after updating (`chromesync service install --launch`), or finish an
-existing profile in the wizard. For checkout installations, keep the checkout and
-Node binary in place; reinstall the service if either moves.
-
-## Profiles and agents
-
-Repeat setup with names such as `personal`, `work`, and `research`. Each pairing
-has its own secret and relay room. Managed browsers have separate Chrome data
-directories; extension sources keep using their selected everyday Chrome profile.
-Choose only the profiles you want to share. A receiver can use a different local
-name; its invitation identifies the source. **Use exactly one source per pairing.**
-Receiver changes are not sent back. Source updates overwrite matching receiver
-cookies; source deletions remove cookies previously imported by the CLI.
-
-To limit access to specific sites, add `--domains example.com,example.org` during
-source setup. An empty list includes all domains; subdomains are included.
+Each import deletes its transfer file. An invitation can authorize only one
+receiver. The relay operator adds the room ID printed by approval to
+`ALLOWED_ROOMS`; both relay backends deny rooms by default.
+[Relay operations](docs/relay-operations.md) includes R2 expiry and alert setup.
 
 ```sh
-chromesync profiles
-chromesync endpoint --name work --json
+chromesync open --name work               # source: sign in once
+chromesync open --name agent --headless   # receiver: omit --headless for a window
+chromesync sync --name work              # source
+chromesync sync --name agent             # receiver
+chromesync service install --launch      # keep syncing after login
+chromesync status --json
 ```
 
-`endpoint` supplies a local CDP connection for an agent or browser automation
-framework. Attach to the existing default browser context to use its cookies.
-See the [complete agent installation recipe](docs/agents.md).
+`chromesync setup` provides a guided setup. For an existing Chrome source, choose
+`--source extension` and connect the named source in extension settings after
+loading the verified extension. Chrome requires user approval to load it. The
+extension stores profile selection and instance identity; private pairing material
+stays in the terminal's OS credential store. Legacy relay/file-drop settings are
+disabled and their stored secrets are purged on configuration access.
 
-This works with agents that can connect to a Chrome browser you control. It is
-not an integration with a specific hosted agent product: a Grok bot, ChatGPT Work,
-or another agent must expose a compatible browser connection to use it.
+## Agents, profiles and revocation
 
-## What gets synced?
-
-| Supported | Not copied |
-| --- | --- |
-| Session and persistent cookies, including HttpOnly, Secure and SameSite attributes | Passwords, passkeys and device-bound credentials |
-| Partitioned cookies with portable partition keys | localStorage, IndexedDB, service workers and cache |
-| Selected named profiles, independently | Bookmarks, extensions, settings, history and tabs |
-| Changed and deleted cookies from the chosen source | A complete live Chrome profile or bidirectional merges |
-
-**Continuous sync does not make logins permanent.** Websites can revoke or rotate
-sessions, bind them to a device, or require a new login. Some apps need non-cookie
-storage too. ChromeSync cannot bypass those requirements.
-
-A byte-for-byte copy of a live profile is not a portable session migration.
-Chrome's remote debugging [requires a non-default data directory](https://developer.chrome.com/blog/remote-debugging-port)
-since Chrome 136. The terminal path therefore creates named ChromeSync browsers
-and asks you to sign in once there; it does not decrypt or copy your everyday
-Chrome cookie database. A ChromeSync name maps to an isolated directory containing
-Chrome's `Default` profile, not a `Profile 1` folder inside your everyday Chrome.
-
-## Already signed in to your everyday Chrome?
-
-Use the optional extension to send cookies from an existing Chrome profile.
-It is useful when you want to keep browsing in your current default profile.
-
-Choose **Your existing everyday Chrome** in terminal setup, or run:
+`chromesync endpoint --name agent --json` returns the receiving browser's local
+CDP endpoint. See [agent instructions](docs/agents.md). Never expose CDP publicly.
+Profiles such as `work`, `personal` and `research` use separate browser directories.
+The source's domain allowlist limits what all its receivers receive.
 
 ```sh
-chromesync setup --name work --role source --source extension --relay https://YOUR-RELAY.workers.dev
+chromesync devices --name work
+chromesync revoke --name work --device DEVICE_ID
 ```
 
-The bridge registers automatically. Setup prints the extension folder. Open
-`chrome://extensions` in the source profile, enable Developer mode, choose
-**Load unpacked**, and select that folder. In ChromeSync settings, choose **work**
-and click **Connect and sync**. That is the only browser-side configuration:
-no extension ID, relay URL, pairing secret, or target folder to enter.
+Remove the revoked room from relay admission too. Other receivers remain paired.
+Revoke website sessions if a device is compromised: already copied login cookies
+cannot be recalled. Passwords, passkeys and local storage are not synced; device
+binding or token rotation can prevent session reuse.
 
-Chrome requires approval/loading of an unpacked extension; the terminal cannot
-silently install it into an everyday profile. The extension’s stable public key
-keeps its ID consistent across installations. Existing users of an older,
-path-derived extension ID should remove/reload that old extension once and
-reconnect the source. `chromesync extension install` repairs native registration
-without asking for an ID.
+Browser restart/offline recovery uses one separately encrypted local checkpoint
+with a seven-day window. Do not clone or roll back live pairing state. Review
+[SECURITY.md](SECURITY.md) for forward-secrecy limits, recovery, migration and
+threat boundaries. There has not been an independent cryptographic audit.
 
-Create receiver invitations with `chromesync setup` or `chromesync pair`, exactly
-as for a terminal-only source. Receivers and agents need no extension. Cookie
-changes are coalesced for about 30 seconds; a one-minute poll retries failures
-and refreshes snapshots as needed. **Sync now** triggers a manual send.
-Connect each everyday Chrome profile to its own source name. A source refuses
-connections from a second extension instance to prevent profile mixing.
+## Authentication requests
 
-The advanced legacy settings remain available for existing extension-only
-pairings. They use a separate configuration and upsert cookies without deletion
-tracking. A connected terminal-managed source takes precedence over those legacy
-settings. The experimental Browser Use Cloud integration remains collapsed.
+The new `chromesync auth` commands run protected browser sessions on a separate
+trusted executor. Agents request authentication; a daily-driver inbox can deny,
+allow once, or save account/origin/factor permissions. A scoped 1Password service
+account supplies passwords and TOTP without contacting the daily driver when a
+saved rule applies. The agent receives neither credential values nor a debugging
+endpoint.
 
-## Self-hosting and development
+Existing passkeys use a dedicated normal 1Password receiver and a browser-level
+WebAuthn bridge. Synthetic real-browser tests pass; live 1Password enrollment and
+service compatibility still require validation. Provider unlock and verification
+requirements remain in force. See [authentication setup](docs/authentication.md)
+for roles, enrollment, commands, current support and acceptance gates.
 
-[Cloudflare Worker deployment](worker/README.md) · [Node/Docker relay](server/README.md)
+## Development
 
 ```sh
-npm test                 # synthetic tests, including temporary Chrome profiles
-npm run test:e2e         # real Chrome + local relay integration tests
-npm run deploy:check     # bundle/validate the Worker without deploying
+npm ci --ignore-scripts
+npm test
+npm run deploy:check
+npm run build:release
 ```
 
-Set `CHROMESYNC_CHROME` to a Chrome executable if auto-discovery fails, or
-`CHROMESYNC_HOME` to change the state directory (default `~/.chromesync`).
-`chromesync doctor --json` checks prerequisites. CLI configuration and invite files
-are private local files; do not commit them. Sync locks are owned by the OS and
-release automatically after crashes or restarts. A busy local lock retries on the
-next watcher pass. See [restart troubleshooting](docs/install.md#restart-and-recovery).
+Tests use synthetic cookies and isolated credential fixtures. Native credential
+integration tests require the platform credential service; Linux CI starts its
+own Secret Service session. Browser integration tests need Chrome. The release
+workflow tests signed-source verification and deterministic archives. See
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
-Code is organized into the terminal CLI, reusable companion, optional extension,
-and interchangeable relays. See [Contributing](CONTRIBUTING.md) and
-[Security](SECURITY.md) for tests, limitations, deployment boundaries and reporting.
-
-## License and support
-
-[MIT](LICENSE), © 2026 Tobias. Contributions and useful bug reports are welcome.
-If ChromeSync saves you a little time, [buy me a coffee](https://buymeacoffee.com/dertobias).
-
-## Independence and disclaimer
-
-ChromeSync is an independent community project. It is not owned by, affiliated
-with, sponsored by, or endorsed by Google LLC. Google Chrome, Chrome and Chromium
-are trademarks of Google LLC. Other product names and trademarks belong to their
-respective owners; mentioning them does not imply endorsement or a partnership.
-
-Use ChromeSync at your own risk. It is provided **“as is,” without warranties**.
-You are responsible for choosing trusted devices and agents, protecting your
-sessions, and ensuring your use is authorized. To the fullest extent permitted
-by applicable law, the authors and contributors accept no liability for claims,
-damages, losses, or misuse arising from this software. See the [MIT license](LICENSE)
-for the full warranty and liability terms.
+If ChromeSync helps, you can [buy Tobias a coffee](https://buymeacoffee.com/dertobias).
+Licensed under [MIT](LICENSE).

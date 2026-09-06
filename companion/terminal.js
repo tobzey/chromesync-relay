@@ -6,7 +6,7 @@ import { filterByAllowlist } from '../src/cookies.js';
 const sameSite = { no_restriction: 'None', lax: 'Lax', strict: 'Strict' };
 
 export async function terminalMessage(msg, { home = configHome(), ...deps } = {}) {
-  const profiles = loadConfig(home).profiles.filter(p => p.role === 'source' && p.sourceMode === 'extension');
+  const profiles = loadConfig(home).profiles.filter(p => p.protocol === 2 && !p.disabled && p.role === 'source' && p.sourceMode === 'extension');
   if (msg.type === 'terminalProfiles') return { ok: true, profiles: profiles.map(p => ({ name: p.name, domains: p.allowlist })) };
   const profile = profiles.find(p => p.name === msg.name);
   if (!profile) throw new Error('Run terminal setup with --source extension for this named profile');

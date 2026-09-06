@@ -1,0 +1,43 @@
+{
+  "extensionVersion": "8.12.34.34",
+  "generatedCredential": true,
+  "privateKeyEncoding": "UTF-8 JSON JWK, EC/P-256/ES256 (synthetic only)",
+  "independentSignatureVerification": true,
+  "verifiedOriginRpIdChallengeCredentialId": true,
+  "modifiedMessageRejected": true,
+  "validFlowNetworkCalls": 0,
+  "authenticatorFlags": 29,
+  "didUnlockInput": false,
+  "consentConclusion": "Core assumes caller consent; returned UV flag is not evidence of real verification.",
+  "negativeCases": [
+    {
+      "label": "unrelated-origin",
+      "error": {
+        "type": "WebAuthnError",
+        "data": {
+          "type": "FetcherError"
+        }
+      }
+    },
+    {
+      "label": "unrelated-rp-id",
+      "error": {
+        "type": "WebAuthnError",
+        "data": {
+          "type": "FetcherError"
+        }
+      }
+    },
+    {
+      "label": "wrong-credential-id",
+      "error": {
+        "type": "WebAuthnError",
+        "data": {
+          "type": "CredentialNotFound"
+        }
+      }
+    }
+  ],
+  "blockedNetworkRequests": 0,
+  "blockedRelatedOriginRequests": 2
+}

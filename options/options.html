@@ -26,8 +26,10 @@
     <p class="muted">Choose where to send this profile’s cookies, then save. A receiving
       Chrome uses a separate folder. Browser passwords and site storage are not copied.</p>
 
-    <section>
-      <h2>Sync through your relay</h2>
+    <section hidden>
+      <h2>Legacy relay disabled</h2>
+      <p>Use the terminal source above and v2 per-device pairing. Legacy shared pairing codes are no longer supported.</p>
+      <fieldset disabled hidden>
       <label class="checkbox"><input type="checkbox" id="rel_enabled" /> Enabled</label>
       <p class="muted">Pushes encrypted cookie files to a small server you run
         yourself. No shared folder needed. Use the same pairing code on both
@@ -66,7 +68,7 @@
       <label>Remote debugging port (0 = auto)
         <input type="number" id="rel_port" min="0" value="0" />
       </label>
-    </section>
+    </fieldset></section>
 
     <section>
       <h2>Schedule</h2>

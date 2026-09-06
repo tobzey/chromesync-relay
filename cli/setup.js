@@ -2,47 +2,27 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
-import { NAME, loadConfig, privateDir, readJson, writePrivate, validateProfile, profilePaths, withProfileLock, withLock } from './config.js';
+import { NAME, loadConfig, privateDir, readJson, validateProfile, profilePaths, withProfileLock } from './config.js';
 import { openProfile } from './browser.js';
 import { registerExtension } from './extension.js';
 import { manageService } from './service.js';
 import { syncProfile } from './sync.js';
-import { deriveRelayAuth } from '../companion/relay-auth.js';
-import { relayList } from '../companion/relay-client.js';
+import { keyPair, randomKey } from '../companion/protocol.js';
+import { credentialId } from '../companion/keychain.js';
+import { createInvite, requestPairing, saveNewProfile, exportRequest } from './pairing.js';
 
+export { createInvite } from './pairing.js';
 export async function createProfile(home, values) {
-  let profile;
-  if (values['invite-file']) {
-    if (values.source && values.source !== 'managed') throw new Error('Receivers use a managed Chrome profile');
-    if (values.role && values.role !== 'receiver') throw new Error('Invites can only create receivers');
-    const invite = readJson(path.resolve(values['invite-file']));
-    if (invite.version !== 1 || invite.kind !== 'chromesync-pairing') throw new Error('Unsupported invite file');
-    profile = { name: values.name, role: 'receiver', relayUrl: invite.relayUrl, secret: invite.secret, sourceHostId: invite.sourceHostId, allowlist: invite.allowlist };
-  } else {
-    if (values.role !== 'source') throw new Error('Sources need --role source --relay URL; receivers need --invite-file PATH');
-    profile = { name: values.name, role: 'source', sourceMode: values.source || 'managed', relayUrl: values.relay,
-      secret: crypto.randomBytes(32).toString('base64url'), sourceHostId: crypto.randomBytes(8).toString('hex'),
-      allowlist: (values.domains || '').split(',').map(d => d.trim().toLowerCase()).filter(Boolean) };
-  }
+  if (values['invite-file']) return requestPairing(home, values);
+  if (values.role !== 'source') throw new Error('Sources need --role source --relay URL; receivers need --invite-file PATH');
+  const identity = keyPair('ed25519');
+  const profile = { name: values.name, role: 'source', sourceMode: values.source || 'managed', relayUrl: values.relay,
+    protocol: 2, secretRef: credentialId(path.resolve(home), values.name), sourcePublicKey: identity.publicKey,
+    sourceHostId: crypto.randomBytes(8).toString('hex'),
+    allowlist: (values.domains || '').split(',').map(d => d.trim().toLowerCase()).filter(Boolean) };
   validateProfile(profile);
-  privateDir(home);
-  await withLock(home, 'config', () => {
-    const config = loadConfig(home);
-    if (config.profiles.some(p => p.name === profile.name)) throw new Error('Profile already exists; choose another name');
-    const paths = profilePaths(home, profile.name);
-    if (fs.existsSync(paths.dir)) throw new Error('Profile directory already exists; choose a new name to preserve its state');
-    privateDir(paths.dir);
-    config.profiles.push(profile);
-    writePrivate(path.join(home, 'config.json'), config);
-  });
+  await saveNewProfile(home, profile, { signingKey: identity.privateKey, recoveryKey: randomKey(), channels: {}, invites: {} });
   return profile;
-}
-
-export function createInvite(profile, file) {
-  if (profile.role !== 'source') throw new Error('Create invites on the source device');
-  writePrivate(file, { version: 1, kind: 'chromesync-pairing', relayUrl: profile.relayUrl,
-    secret: profile.secret, sourceHostId: profile.sourceHostId, allowlist: profile.allowlist }, { exclusive: true });
-  return file;
 }
 
 export async function runWizard(home, deps = {}) {
@@ -54,8 +34,7 @@ export async function runWizard(home, deps = {}) {
   const service = deps.service || (() => manageService('install', home, { launch: true }));
   const sync = deps.sync || (profile => syncProfile(home, profile));
   const probe = deps.probe || (profile => {
-    const { token, roomId } = deriveRelayAuth(profile.secret);
-    return relayList({ relayUrl: profile.relayUrl, token, roomId, timeoutMs: 5000 });
+    return fetch(new URL('/health', profile.relayUrl), { signal: AbortSignal.timeout(5000), redirect: 'error' }).then(r => { if (!r.ok) throw new Error('Relay unavailable'); });
   });
   const yes = async (question, fallback = true) => {
     for (;;) {
@@ -77,7 +56,7 @@ export async function runWizard(home, deps = {}) {
     say('\nWelcome to ChromeSync. Let’s connect your browsers.');
     say('Each profile has one source. Only its session cookies are shared with paired receivers.');
     do {
-      const configured = loadConfig(home).profiles;
+      const configured = loadConfig(home).profiles.filter(p => !p.disabled);
       let profile;
       if (configured.length) {
         say(`Configured profiles: ${configured.map(p => p.name).join(', ')}`);
@@ -110,6 +89,7 @@ export async function runWizard(home, deps = {}) {
         }
         say(`Saved ${profile.name}. You can resume this setup by choosing “existing” next time.`);
       }
+      if (profile.pending) { Object.assign(profile, await exportRequest(home, profile)); say(`Pairing request: ${profile.requestFile}. Return it to the source and compare its fingerprint: ${profile.fingerprint}. Run chromesync activate after source approval.`); continue; }
       try { await probe(profile); say('Relay connection verified.'); }
       catch { say('The relay is not reachable yet. Settings are saved; sync will report connection errors until it is available.'); }
 
@@ -138,8 +118,8 @@ export async function runWizard(home, deps = {}) {
         const proposed = path.join(invites, `${profile.name}.invite.json`);
         const file = (await ask(`Invitation file [${proposed}]: `)).trim() || proposed;
         try {
-          createInvite(profile, path.resolve(file));
-          say(`Invitation saved to ${file}. Transfer privately, run setup on the receiver, and choose this file. Delete it after pairing.`);
+          await createInvite(profile, path.resolve(file), { home });
+          say(`Invitation saved to ${file}. Expires in 15 minutes. Receiver setup creates a key request; approve its fingerprint on this source with chromesync approve.`);
         } catch { say('Could not create the invitation (existing files are never overwritten). Use chromesync pair --name ' + profile.name + ' --output /private/new.invite.json.'); }
       }
       if (!extension && await yes('Keep syncing after login? This starts a background service and keeps Chrome open.')) {

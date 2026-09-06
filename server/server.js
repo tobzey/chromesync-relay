@@ -1,3 +1,4 @@
+import { admitted } from './admission.js';
 // ChromeSync relay: untrusted opaque blob store. Node stdlib `http`/`https`
 // only. TLS is terminated by a reverse proxy by default; optional native TLS
 // via TLS_CERT/TLS_KEY. Never logs tokens, secrets, or blob bodies.
@@ -84,6 +85,7 @@ function readBody(req, maxBytes) {
 }
 
 function logLine(log, { method, roomId, name, status, size }) {
+  if ([403, 429, 507].includes(status)) log(JSON.stringify({ event: 'relay-security-alert', status, reason: status === 507 ? 'quota' : status === 429 ? 'rate-limit' : 'admission', roomId: roomId || null }));
   // method, roomId (public), name, status, size ONLY.
   log(`${method} ${roomId || "-"} ${name || "-"} ${status} ${size ?? 0}`);
 }
@@ -160,6 +162,9 @@ export async function startRelay(overrides = {}) {
         return;
       }
 
+      if (!admitted(config, roomId)) {
+        send(res, 403); logLine(log, { method, roomId, name, status: 403, size: 0 }); return;
+      }
       if (!roomLimiter.take(roomId)) {
         send(res, 429, STATUS_TEXT[429], "text/plain", { "Retry-After": "1" });
         logLine(log, { method, roomId, name, status: 429, size: 0 });

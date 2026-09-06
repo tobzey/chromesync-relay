@@ -53,6 +53,7 @@ async function raw({ url, method, token, body, headers, roomId, name }) {
 async function withRelay(extra, fn) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "chromesync-relay-"));
   const relay = await startRelay({
+    allowedRooms: [deriveRelayAuth(SECRET).roomId],
     host: "127.0.0.1",
     port: 0,
     dataDir,
