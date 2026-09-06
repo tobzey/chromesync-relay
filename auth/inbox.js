@@ -53,7 +53,7 @@ export async function startApprovalInbox({ call, port = 0, role = 'approver' }) 
       if (!OWNER_OPERATIONS.has(body.operation)) return send(res, 403, { error: 'Operation unavailable' });
       const result = await call(body.operation, body.args || {});
       return send(res, 200, { result });
-    } catch { send(res, 400, { error: 'Operation failed. Check the executor connection and enrollment.' }); }
+    } catch (error) { send(res, 400, { error: 'Operation failed. Check the executor connection and enrollment.', code: typeof error?.code === 'string' && /^[A-Z_]{1,40}$/.test(error.code) ? error.code : 'OPERATION_REJECTED' }); }
   });
   server.requestTimeout = 100000;
   server.headersTimeout = 5000;

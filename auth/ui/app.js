@@ -16,7 +16,7 @@ async function call(operation, args = {}, { timeoutMs, allowFailed = false } = {
   try {
     const response = await fetch('/api', { method: 'POST', headers: { 'content-type': 'application/json', 'x-csrf-token': csrf }, body: JSON.stringify({ operation, args }), signal: controller?.signal });
     const body = await response.json();
-    if (!response.ok || body.result?.status === 'uncertain') throw new Error(body.error || 'The executor has not confirmed the result. Check its status before trying again.');
+    if (!response.ok || body.result?.status === 'uncertain') throw new Error((body.error ? `${body.error}${/^[A-Z_]{1,40}$/.test(body.code || '') ? ` (${body.code})` : ''}` : '') || 'The executor has not confirmed the result. Check its status before trying again.');
     if (body.result?.status === 'failed' && !allowFailed) throw new Error(`The executor could not complete this request (${body.result.reason || 'failed'}).`);
     return body.result;
   } catch (error) {
@@ -43,6 +43,21 @@ function renderPages(view, page, selector) {
   if (state.history.length) container.append(action('Previous page', () => { state.cursor = state.history.pop(); requestRenderKey = undefined; }));
   if (page.hasMore) container.append(action('Next page', () => { state.history.push(state.cursor); state.cursor = page.nextCursor; requestRenderKey = undefined; }));
 }
+function failureText(request) {
+  if (request.reason === 'authentication-uncertain' && request.diagnostic?.credentialsSupplied === true) return 'Credentials were submitted but sign-in was not verified. Check the site in the protected browser before retrying.';
+  const messages = {
+    VERIFICATION_REQUIRED: 'The site signed in but did not show the selected account. Open the protected browser, check the account, and confirm.',
+    TOTP_UNAVAILABLE: 'The site asked for an authenticator code this account does not have.',
+    PASSWORD_CHANGE_FORBIDDEN: 'The site asked to change the password. Complete this yourself in the protected browser.',
+    EXPECTED_CONTROL_UNAVAILABLE: 'The expected sign-in control is unavailable. Check the protected browser.',
+    SESSION_CHANGED: 'The browser changed after this request. Check the current page before requesting again.',
+    BROWSER_CLOSED: 'The protected browser is no longer open. Ask the agent to open a new session.',
+    AUTH_INVALID: 'The vault connection failed: the token is invalid. Check the connection in Vault & devices.',
+    CREDENTIAL_MISSING: 'The vault connection failed: no credential is stored. Check the connection in Vault & devices.',
+    NETWORK_UNAVAILABLE: 'The vault connection failed: the executor could not reach the vault. Check the connection in Vault & devices.',
+  };
+  return messages[request.diagnostic?.code] || 'Authentication did not complete. Review the service connection, then retry or complete it in the protected browser.';
+}
 function renderRequests(requests, hasMore) {
   const key = JSON.stringify([requests, hasMore]);
   if (requestRenderKey === key) return;
@@ -62,8 +77,8 @@ function renderRequests(requests, hasMore) {
       if (request.catalog.accountVerificationRequired) card.append(element('p', 'Verify the account shown by the sign-in provider before completing this request.'));
     }
     if (request.sessionHandoff) card.append(element('p', 'After sign-in, the authenticated session can be transferred to the requesting agent’s browser. The agent will be able to use this account’s session.'));
-    if (request.status === 'needs-user') card.append(element('p', 'This authentication needs protected user interaction. A saved permission cannot complete it automatically.'));
-    if (request.status === 'failed') card.append(element('p', 'Authentication did not complete. Review the service connection, then retry or complete it in the protected browser.'));
+    if (['needs-user', 'failed'].includes(request.status)) card.append(element('p', failureText(request)));
+    if (/^[A-Z_]{1,80}$/.test(request.diagnostic?.code || '')) card.append(element('p', request.diagnostic.code, 'meta'));
     if (['approved', 'authenticating'].includes(request.status)) card.append(element('p', 'Authentication is running. The agent is paused.'));
     const factors = element('div', undefined, 'factors');
     for (const factor of request.factors || []) {

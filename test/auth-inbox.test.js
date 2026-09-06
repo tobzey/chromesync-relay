@@ -19,3 +19,16 @@ test('trusted inbox rejects forged origin, missing CSRF, agent operations and cr
   assert.equal((await fetch(`${inbox.url}/api/bootstrap`, { headers: { cookie, 'sec-fetch-site': 'cross-site' } })).status, 403);
   assert.equal((await post('requests')).status, 200); assert.equal(calls.length, 1);
 });
+
+test('inbox returns only a validated rejection code and fixed text', async t => {
+  const inbox = await startApprovalInbox({ call: async () => { throw Object.assign(new Error('SECRET-SENTINEL'), { code: 'SESSION_CLOSED' }); } });
+  t.after(() => inbox.close());
+  const page = await fetch(inbox.url);
+  const cookie = page.headers.get('set-cookie').split(';')[0];
+  const { csrf } = await fetch(`${inbox.url}/api/bootstrap`, { headers: { cookie } }).then(r => r.json());
+  const response = await fetch(`${inbox.url}/api`, { method: 'POST', headers: { cookie, origin: inbox.url, 'x-csrf-token': csrf, 'content-type': 'application/json' }, body: JSON.stringify({ operation: 'requests' }) });
+  assert.equal(response.status, 400);
+  const result = await response.json();
+  assert.equal(result.code, 'SESSION_CLOSED');
+  assert(!JSON.stringify(result).includes('SECRET-SENTINEL'));
+});

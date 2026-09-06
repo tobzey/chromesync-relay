@@ -53,6 +53,12 @@ The executor must run outside the agent's OS and filesystem authority.
 `;
 
 export async function runAuthCli(argv = process.argv.slice(3)) {
+  try { return await run(argv); } catch (error) {
+    console.log(JSON.stringify({ status: 'failed', reason: typeof error?.code === 'string' && /^[A-Z_]{1,40}$/.test(error.code) ? error.code : 'OPERATION_REJECTED' }));
+    process.exitCode = 1;
+  }
+}
+async function run(argv) {
   const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: {
     role: { type: 'string' }, output: { type: 'string' }, relay: { type: 'string' }, fingerprint: { type: 'string' },
     'request-file': { type: 'string' }, 'activation-file': { type: 'string' }, port: { type: 'string' },

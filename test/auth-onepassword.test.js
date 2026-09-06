@@ -23,5 +23,20 @@ test('password-only grants never retrieve OTP and provider errors cannot cross t
   const refs = [];
   const provider = createOnePasswordProvider({ loadToken: async () => 'synthetic', loadSdk: async () => ({ createClient: async () => ({ secrets: { resolve: async ref => { refs.push(ref); if (ref.endsWith('password')) throw new Error('synthetic-password-must-not-leak'); return 'synthetic'; } } }) }) });
   const result = await provider.useFactors(enrollment, ['password'], async () => { throw new Error('must not fill'); });
-  assert.deepEqual(result, { status: 'unavailable' }); assert.ok(refs.every(ref => !ref.includes('otp')));
+  assert.deepEqual(result, { status: 'unavailable', reason: 'credentials-unavailable' }); assert.ok(refs.every(ref => !ref.includes('otp')));
+});
+
+test('consume diagnostics preserve only safe codes and supply state while connection failures update health', async () => {
+  const provider = createOnePasswordProvider({ loadToken: async () => 'synthetic', loadSdk: async () => ({ createClient: async () => ({ secrets: { resolve: async () => 'synthetic' } }) }) });
+  for (const supplied of [true, false]) {
+    const result = await provider.useFactors(enrollment, ['password'], () => { throw Object.assign(new Error('SECRET-SENTINEL'), { code: 'BROWSER_CLOSED', credentialsSupplied: supplied }); });
+    assert.deepEqual(result, { status: 'failed', reason: 'BROWSER_CLOSED', credentialsSupplied: supplied });
+    assert(!JSON.stringify(result).includes('SECRET-SENTINEL'));
+  }
+  const bad = createOnePasswordProvider({ loadToken: async () => 'synthetic', loadSdk: async () => ({ createClient: async () => { throw new Error('invalid service account token, SECRET-SENTINEL'); } }) });
+  assert.deepEqual(await bad.useFactors(enrollment, ['password'], () => {}), { status: 'unavailable', reason: 'auth-invalid' });
+  assert.equal(bad.diagnostics('default').code, 'auth-invalid');
+  assert(!JSON.stringify(bad.diagnostics('default')).includes('SECRET-SENTINEL'));
+  const missing = createOnePasswordProvider({ loadToken: async () => '' });
+  assert.equal((await missing.useFactors(enrollment, ['password'], () => {})).reason, 'credential-missing');
 });

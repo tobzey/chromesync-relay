@@ -129,7 +129,7 @@ test('protected pipe browser authenticates multi-page password/TOTP without publ
           return otp;
         }});
       });
-      assert.deepEqual(result,{status:'authenticated'});
+      assert.deepEqual(result,{status:'authenticated',credentialsSupplied:true});
       assert.equal(totpCalls,1);
       assert.equal(otpSubmissions,1);
       assert.equal([...fixtureSessions.values()].filter(item => item.authenticated).length,1);
@@ -157,7 +157,7 @@ test('protected pipe browser authenticates multi-page password/TOTP without publ
       }}),{signal:cancellation.signal});
       await reached;
       cancellation.abort();
-      assert.deepEqual(await pending,{status:'needs-user',reason:'ABORTED'});
+      assert.deepEqual(await pending,{status:'needs-user',reason:'ABORTED',credentialsSupplied:true});
       finishTotp(otp);
       await assert.rejects(controller.observe(cancelled.id,'agent-a'),{code:'AUTHENTICATION_REQUIRED'});
       assert.equal(otpSubmissions,1);
@@ -227,7 +227,7 @@ test('protected pipe browser authenticates multi-page password/TOTP without publ
       assert.equal((await controller.inspectSession(wrong.id,'agent-a')).purpose,'unknown');
       await controller.navigate(wrong.id,'agent-a',`${origin}/login?wrong-account=1`);
       const wrongResult=await controller.withAuthenticationLease(await controller.inspectSession(wrong.id,'agent-a'),sink=>sink({username,password,totp:otp}));
-      assert.deepEqual(wrongResult,{status:'needs-user',reason:'SUCCESS_NOT_CONFIRMED'});
+      assert.deepEqual(wrongResult,{status:'needs-user',reason:'SUCCESS_NOT_CONFIRMED',credentialsSupplied:true});
       assert.equal((await controller.inspectSession(wrong.id,'agent-a')).purpose,'unknown');
       await assert.rejects(controller.observe(wrong.id,'agent-a'),{code:'AUTHENTICATION_REQUIRED'});
       const wrongTakeover=await controller.startTakeover(wrong.id);

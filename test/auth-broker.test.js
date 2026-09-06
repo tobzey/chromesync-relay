@@ -905,3 +905,41 @@ test('catalog-derived resources can be admitted beyond 100 accounts without gran
   assert.ok(authDataBytes(state) < AUTH_DATA_BUDGET);
   assert.equal(f.calls.provider, 0); assert.equal(f.calls.sink, 0);
 });
+
+for (const supplied of [true, false]) test(`fill diagnostics retain safe code and supplied=${supplied}`, async t => {
+  const f = await fixture(t);
+  f.providers.synthetic.useFactors = async () => ({ status: 'failed', reason: 'VERIFICATION_REQUIRED', credentialsSupplied: supplied, message: 'SECRET-SENTINEL' });
+  const request = await f.request();
+  const result = await f.broker.decide(request.requestId, { decision: 'once' }, 'owner-1');
+  assert.equal(result.status, supplied ? 'needs-user' : 'failed');
+  assert.equal(result.reason, supplied ? 'authentication-uncertain' : 'verification-required');
+  assert.deepEqual(result.diagnostic, { code: 'VERIFICATION_REQUIRED', credentialsSupplied: supplied });
+  const state = await f.store.read();
+  assert.equal(state.audit.at(-1).diagnostic.code, 'VERIFICATION_REQUIRED');
+  assert.equal(state.audit.at(-1).reason, result.reason);
+  assert.equal(state.audit.at(-1).previousStatus, 'authenticating');
+  assert(!JSON.stringify([result, await f.broker.listPending(), state]).includes('SECRET-SENTINEL'));
+});
+
+test('provider connection code reaches outcome as provider-unavailable', async t => {
+  const f = await fixture(t);
+  f.providers.synthetic.useFactors = async () => ({ status: 'unavailable', reason: 'auth-invalid' });
+  const request = await f.request();
+  const result = await f.broker.decide(request.requestId, { decision: 'once' }, 'owner-1');
+  assert.equal(result.reason, 'provider-unavailable');
+  assert.equal(result.diagnostic.code, 'AUTH_INVALID');
+});
+
+test('store failure selecting execution preserves approved instead of browser-unavailable', async t => {
+  const f = await fixture(t);
+  const request = await f.request();
+  const mutate = f.store.mutate.bind(f.store);
+  let fail = true;
+  const store = { ...f.store, mutate: async fn => {
+    if (fail && (await f.store.read()).requests[0]?.status === 'approved') { fail = false; throw new AuthStoreError('SECRET-SENTINEL'); }
+    return mutate(fn);
+  } };
+  const broker = createBroker({ ...f.configuration, store });
+  await assert.rejects(broker.decide(request.requestId, { decision: 'once' }, 'owner-1'), AuthStoreError);
+  assert.equal((await f.store.read()).requests[0].status, 'approved');
+});

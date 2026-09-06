@@ -621,20 +621,20 @@ export function createBrowserController({chromePath, profileRoot, services = [],
         if (result?.status === 'authenticated' || result?.authenticated === true || result === true) {
           if (!await verifySuccess(session,flow,lease.signal,Math.min(lease.deadline,Date.now()+flow.timeoutMs))) {
             session.quarantined = true;
-            return {status:'needs-user',reason:'SUCCESS_NOT_CONFIRMED'};
+            return {status:'needs-user',reason:'SUCCESS_NOT_CONFIRMED',credentialsSupplied:sinkInvoked};
           }
           if(session.service.adaptive)await callPage(session,adaptivePage,[session.stateKey,session.planKey,'clear',{}],lease.signal);
           else await callPage(session,clearCredentialFields,[session.service.credentialSelectors],lease.signal);
           session.quarantined = false;
-          return {status:'authenticated'};
+          return {status:'authenticated',credentialsSupplied:sinkInvoked};
         }
         if (sinkInvoked) session.quarantined = true;
-        return {status:result?.status === 'needs-user' ? 'needs-user' : 'failed',reason:
-          typeof result?.reason === 'string' && /^[A-Z_]{1,80}$/.test(result.reason) ? result.reason : 'AUTHENTICATION_NOT_COMPLETED'};
+        return {credentialsSupplied:sinkInvoked,status:['needs-user','unavailable','unsupported'].includes(result?.status) ? result.status : 'failed',reason:
+          typeof result?.reason === 'string' && /^(?:[A-Z_]{1,80}|[a-z]+(?:-[a-z]+)*)$/.test(result.reason) ? result.reason : 'AUTHENTICATION_NOT_COMPLETED'};
       } catch (error) {
         if (sinkInvoked || error.code === 'ABORTED') session.quarantined = true;
-        if (['SESSION_CHANGED','AUTH_FLOW_UNAVAILABLE'].includes(error.code)) throw error;
-        return {status:error.code === 'ABORTED' ? 'needs-user' : 'failed',reason:safeReason(error)};
+        if (error.name === 'AuthStoreError' || ['SESSION_CHANGED','AUTH_FLOW_UNAVAILABLE'].includes(error.code)) { error.credentialsSupplied = sinkInvoked; throw error; }
+        return {credentialsSupplied:sinkInvoked,status:error.code === 'ABORTED' ? 'needs-user' : 'failed',reason:safeReason(error)};
       } finally {
         lease.active = false;
         clearTimeout(timer);

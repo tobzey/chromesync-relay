@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { admitAuthGrowth } from './store.js';
+import { AuthStoreError, admitAuthGrowth } from './store.js';
 import {
   PURPOSES, validId, normalizeFactors, normalizeOrigin, normalizeEnrollment,
   normalizeDecision, makePolicy, policyMatches, sameConfiguration,
@@ -86,9 +86,18 @@ function abortable(operation, signal) {
   });
 }
 
+function diagnosticCode(value) {
+  if (typeof value !== 'string') return undefined;
+  const code = value.replaceAll('-', '_').toUpperCase();
+  return /^[A-Z_]{1,80}$/.test(code) ? code : undefined;
+}
+function diagnosticView(value) {
+  const code = diagnosticCode(value?.code);
+  return code ? { code, credentialsSupplied: value.credentialsSupplied === true } : undefined;
+}
 function outcome(request) {
   if (!request) return { status: 'failed', reason: 'not-found' };
-  return { requestId: request.id, status: request.status, ...(request.reason ? { reason: request.reason } : {}) };
+  return { requestId: request.id, status: request.status, ...(request.reason ? { reason: request.reason } : {}), ...(diagnosticView(request.diagnostic) ? { diagnostic: diagnosticView(request.diagnostic) } : {}) };
 }
 
 function audit(state, event, request, time, actorId, details = {}) {
@@ -98,12 +107,14 @@ function audit(state, event, request, time, actorId, details = {}) {
 }
 
 function setState(state, request, status, reason, time, actorId) {
+  const previousStatus = request.status;
   request.status = status;
+  if (status === 'succeeded') delete request.diagnostic;
   request.updatedAt = time;
   if (reason) request.reason = reason;
   else delete request.reason;
   if (!OPEN.has(status)) request.completedAt = time;
-  audit(state, status, request, time, actorId);
+  audit(state, status, request, time, actorId, { previousStatus, ...(reason ? { reason } : {}), ...(diagnosticView(request.diagnostic) ? { diagnostic: { code: request.diagnostic.code } } : {}) });
 }
 
 function expire(state, time) {
@@ -241,19 +252,20 @@ export function createBroker({ store, controller, providers, now = Date.now, exe
     aborters.set(id, abortController);
     const deadline = setTimeout(() => abortController.abort(abortError()), executionTimeoutMs);
     const work = (async () => {
-      const selected = await store.mutate((state) => {
-        expire(state, now());
-        const request = state.requests.find((item) => item.id === id);
-        if (request?.status !== 'approved') return null;
-        if (!grantValid(state, request, now())) {
-          setState(state, request, 'denied', 'authorization-invalidated', now());
-          return null;
-        }
-        return { request, enrollment: state.enrollments.find((item) => item.serviceId === request.serviceId) };
-      });
-      if (!selected) return readCurrent(id);
-      const { request, enrollment } = selected;
+      let credentialsSupplied = false;
       try {
+        const selected = await store.mutate((state) => {
+          expire(state, now());
+          const request = state.requests.find((item) => item.id === id);
+          if (request?.status !== 'approved') return null;
+          if (!grantValid(state, request, now())) {
+            setState(state, request, 'denied', 'authorization-invalidated', now());
+            return null;
+          }
+          return { request, enrollment: state.enrollments.find((item) => item.serviceId === request.serviceId) };
+        });
+        if (!selected) return readCurrent(id);
+        const { request, enrollment } = selected;
         const inspected = await abortable(controller.inspectSession(request.sessionId, request.requesterId), signal);
         const current = sessionSnapshot(inspected, request.sessionId, request.requesterId, enrollment);
         if (!sameConfiguration(current, request.session)) {
@@ -302,7 +314,11 @@ export function createBroker({ store, controller, providers, now = Date.now, exe
             if (supplied) return { status: 'failed' };
             supplied = true;
             await assertAuthorized();
-            return abortable(sink(credentials), signal);
+            try {
+              const result = await abortable(sink(credentials), signal);
+              credentialsSupplied = result?.credentialsSupplied !== false;
+              return result;
+            } catch (error) { credentialsSupplied = error?.credentialsSupplied !== false; throw error; }
           };
           for (const method of ['inspect', 'assertCurrent']) {
             if (typeof sink[method] === 'function') guardedSink[method] = async (...args) => {
@@ -316,20 +332,37 @@ export function createBroker({ store, controller, providers, now = Date.now, exe
           expire(state, now());
           const row = state.requests.find((item) => item.id === id);
           if (row?.status !== 'authenticating') return;
-          switch (result?.status) {
-            case 'authenticated': setState(state, row, 'succeeded', null, now()); break;
+          const code = diagnosticCode(result?.reason);
+          const supplied = result?.credentialsSupplied ?? credentialsSupplied;
+          if (code) row.diagnostic = { code, credentialsSupplied: supplied === true, at: now() };
+          if (result?.status === 'authenticated') setState(state, row, 'succeeded', null, now());
+          else if (supplied === true) setState(state, row, 'needs-user', 'authentication-uncertain', now());
+          else if (code === 'SESSION_CHANGED') setState(state, row, 'needs-user', 'session-changed', now());
+          else if (code === 'AUTH_FLOW_UNAVAILABLE') setState(state, row, 'needs-user', 'unrecognized-authentication', now());
+          else switch (result?.status) {
             case 'needs-user': setState(state, row, 'needs-user', 'interaction-required', now()); break;
             case 'unsupported': setState(state, row, 'needs-user', 'provider-unsupported', now()); break;
             case 'unavailable': setState(state, row, 'failed', 'provider-unavailable', now()); break;
-            default: setState(state, row, 'failed', 'authentication-failed', now());
+            default: setState(state, row, 'failed', ['BROWSER_CLOSED','SESSION_NOT_FOUND'].includes(code) ? 'browser-unavailable' : code ? code.toLowerCase().replaceAll('_','-') : 'authentication-failed', now());
           }
         });
-      } catch {
+      } catch (error) {
+        const storeError = error instanceof AuthStoreError;
+        let rethrow = false;
         await store.mutate((state) => {
           const row = state.requests.find((item) => item.id === id);
-          if (row?.status === 'authenticating') setState(state, row, 'needs-user', 'authentication-uncertain', now());
-          else if (row?.status === 'approved') setState(state, row, 'failed', 'browser-unavailable', now());
+          if (!['approved','authenticating'].includes(row?.status)) return;
+          if (storeError && row.status === 'approved') { rethrow = true; return; }
+          const code = storeError ? 'STORE_UNAVAILABLE' : error?.name === 'AbortError' ? 'ABORTED' : diagnosticCode(error?.code);
+          const supplied = error?.credentialsSupplied ?? credentialsSupplied;
+          if (code) row.diagnostic = { code, credentialsSupplied: supplied === true, at: now() };
+          if (code === 'SESSION_CHANGED') setState(state, row, 'needs-user', 'session-changed', now());
+          else if (code === 'AUTH_FLOW_UNAVAILABLE') setState(state, row, 'needs-user', 'unrecognized-authentication', now());
+          else if (['BROWSER_CLOSED','SESSION_NOT_FOUND'].includes(code) && !supplied) setState(state, row, 'failed', 'browser-unavailable', now());
+          else if (row.status === 'authenticating' || supplied) setState(state, row, 'needs-user', 'authentication-uncertain', now());
+          else if (code !== 'ABORTED') setState(state, row, 'failed', 'browser-unavailable', now());
         });
+        if (rethrow) throw error;
       }
       return readCurrent(id);
     })();

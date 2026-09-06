@@ -100,7 +100,7 @@ export function createOnePasswordProvider({ loadToken, loadSdk = () => import('@
   }
   const record = (providerId, update) => {
     if (update.status === 'error') {
-      const diagnostic = failure(update.error, update.stage).diagnostic;
+      const diagnostic = update.code && Object.hasOwn(CONNECTION_MESSAGES, update.code) ? new OnePasswordConnectionError(update).diagnostic : failure(update.error, update.stage).diagnostic;
       health.set(providerId, { ...diagnostic, ...(Number.isFinite(update.retryAt) ? { retryAt: update.retryAt } : {}) });
     } else health.set(providerId, { ...update, checkedAt: update.checkedAt ?? now() });
   };
@@ -109,6 +109,7 @@ export function createOnePasswordProvider({ loadToken, loadSdk = () => import('@
       const version = versions.get(providerId) ?? 0;
       clients.set(providerId, (async () => {
         const token = await loadToken(providerId);
+        if (typeof token !== 'string' || !token) throw Object.assign(new Error('Credential missing'), { code: 'CREDENTIAL_MISSING' });
         return connect(token, stage => {
           if ((versions.get(providerId) ?? 0) === version) record(providerId, { status: 'checking', stage });
         });
@@ -188,9 +189,9 @@ export function createOnePasswordProvider({ loadToken, loadSdk = () => import('@
         if (!Array.isArray(factors) || !factors.length || factors.some(f => !enrollment.factors.includes(f))) return { status: 'needs-user' };
         const sdk = await client(providerId);
         const resolve = async ref => {
-          if (!active || signal?.aborted) throw new Error('Credential lease ended');
+          if (!active || signal?.aborted) throw Object.assign(new Error('Credential lease ended'), { code: 'CREDENTIAL_LEASE_ENDED' });
           const value = await sdk.secrets.resolve(ref);
-          if (!active || signal?.aborted) throw new Error('Credential lease ended');
+          if (!active || signal?.aborted) throw Object.assign(new Error('Credential lease ended'), { code: 'CREDENTIAL_LEASE_ENDED' });
           if (typeof value !== 'string' || !value) throw new Error('Provider unavailable');
           return value;
         };
@@ -201,22 +202,26 @@ export function createOnePasswordProvider({ loadToken, loadSdk = () => import('@
         if (factors.includes('totp')) {
           let calls = 0;
           credentials.totp = async () => {
-            if (!active || signal?.aborted || ++calls > 3) throw new Error('Credential lease ended');
+            if (!active || signal?.aborted || ++calls > 3) throw Object.assign(new Error('Credential lease ended'), { code: 'CREDENTIAL_LEASE_ENDED' });
             const periodMs = (enrollment.totpPeriodSeconds ?? 30) * 1000;
             const remaining = periodMs - (now() % periodMs);
             if (remaining < 5000) await sleep(remaining + 100, undefined, { signal });
-            if (!active || signal?.aborted) throw new Error('Credential lease ended');
+            if (!active || signal?.aborted) throw Object.assign(new Error('Credential lease ended'), { code: 'CREDENTIAL_LEASE_ENDED' });
             return resolve(`${reference(enrollment, enrollment.fields.totp)}?attribute=otp`);
           };
         }
         let result;
         try { result = await consume(credentials); }
-        catch { return { status: signal?.aborted ? 'needs-user' : 'failed' }; }
+        catch (error) { if (error?.name === 'AuthStoreError') throw error; return { status: signal?.aborted ? 'needs-user' : 'failed', reason: /^[A-Z_]{1,80}$/.test(error?.code || '') ? error.code : 'FILL_FAILED', credentialsSupplied: error?.credentialsSupplied === true }; }
         const status = result === true ? 'authenticated' : result?.status;
-        return { status: STATUSES.has(status) ? status : 'failed' };
-      } catch {
+        return { status: STATUSES.has(status) ? status : 'failed',
+          ...(typeof result?.reason === 'string' && /^[A-Z_]{1,80}$/.test(result.reason) ? { reason: result.reason } : {}),
+          ...(typeof result?.credentialsSupplied === 'boolean' ? { credentialsSupplied: result.credentialsSupplied } : {}) };
+      } catch (error) {
+        if (error?.name === 'AuthStoreError') throw error;
         clients.delete(providerId);
-        return { status: 'unavailable' };
+        if (error instanceof OnePasswordConnectionError) { record(providerId, error.diagnostic); return { status: 'unavailable', reason: error.diagnostic.code }; }
+        return { status: 'unavailable', reason: error?.code === 'CREDENTIAL_MISSING' ? 'credential-missing' : 'credentials-unavailable' };
       } finally {
         active = false;
         for (const key of Object.keys(credentials)) delete credentials[key];

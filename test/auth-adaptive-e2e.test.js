@@ -122,7 +122,7 @@ test('adaptive browser binds live fields, completes password/TOTP, verifies acco
   const denied=await prepare(session);const abort=new AbortController();abort.abort();let retrieved=false;
   await assert.rejects(controller.withAuthenticationLease(denied,()=>{retrieved=true;},{signal:abort.signal}),{code:'ABORTED'});
   assert.equal(retrieved,false);assert.equal(passwordPosts,0);
-  assert.deepEqual(await authenticate(session),{status:'authenticated'});
+  assert.deepEqual(await authenticate(session),{status:'authenticated',credentialsSupplied:true});
   assert.equal(passwordPosts,1);assert.equal(otpPosts,1);
   const observed=await controller.observe(session.id,'agent');
   assert.equal(observed.purpose,'authenticated');assert(!JSON.stringify(observed).includes(username));
@@ -178,7 +178,7 @@ test('adaptive browser binds live fields, completes password/TOTP, verifies acco
     return result;
   });
   try{
-    assert.deepEqual(await authenticate(delayed),{status:'authenticated'});
+    assert.deepEqual(await authenticate(delayed),{status:'authenticated',credentialsSupplied:true});
     assert(emptyAccountObserved,'the newly committed account document was observed before its identity arrived');
     assert(subsequentInspection,'the controller continued inspecting after that incomplete document');
     assert(incompleteFormObserved,'the next credential form was observed before its submit button arrived');
@@ -200,7 +200,7 @@ test('adaptive browser binds live fields, completes password/TOTP, verifies acco
     return result;
   });
   try{
-    assert.deepEqual(await authenticate(loading),{status:'authenticated'});
+    assert.deepEqual(await authenticate(loading),{status:'authenticated',credentialsSupplied:true});
     assert(originalControlsObserved,'the loading label did not replace the submitted OTP controls');
     assert.equal(otpPosts,otpBeforeLoading+1,'cosmetic loading changes never resubmit the OTP');
   }finally{loadingRace.mock.restore();loadingSubmission?.release();await controller.closeSession(loading.id,'agent');}
@@ -227,7 +227,7 @@ test('adaptive browser binds live fields, completes password/TOTP, verifies acco
     return result;
   });
   try{
-    assert.deepEqual(await authenticate(reenabled),{status:'authenticated'});
+    assert.deepEqual(await authenticate(reenabled),{status:'authenticated',credentialsSupplied:true});
     assert(disabledObserved,'the controller inspected the temporarily disabled submitted input');
     assert(replacementBlocked,'preparation atomically rejected the re-enabled original input');
     assert.equal(otpPosts,otpBeforeReenabled+1,'the disabled/re-enabled gap never resubmits the OTP');
@@ -235,7 +235,7 @@ test('adaptive browser binds live fields, completes password/TOTP, verifies acco
 
   for(const mode of ['wrong','unverified']){
     const unknown=await discover('/login?mode='+mode);
-    assert.deepEqual(await authenticate(unknown),{status:'needs-user',reason:'VERIFICATION_REQUIRED'});
+    assert.deepEqual(await authenticate(unknown),{status:'needs-user',reason:'VERIFICATION_REQUIRED',credentialsSupplied:true});
     await assert.rejects(controller.exportSession(unknown.id,'agent'),{code:'AUTHENTICATION_REQUIRED'});
     const takeover=await controller.startTakeover(unknown.id);
     assert.deepEqual(await controller.finishTakeover(takeover.takeoverId),{status:'needs-user',reason:'VERIFICATION_REQUIRED'});
@@ -273,7 +273,7 @@ test('adaptive browser binds live fields, completes password/TOTP, verifies acco
     }
     await controller.closeSession(unknown.id,'agent');
   }
-  const echo=await discover('/login?mode=echo');assert.deepEqual(await authenticate(echo),{status:'authenticated'});
+  const echo=await discover('/login?mode=echo');assert.deepEqual(await authenticate(echo),{status:'authenticated',credentialsSupplied:true});
   await assert.rejects(controller.exportSession(echo.id,'agent'),{code:'CREDENTIAL_ECHO'});await controller.closeSession(echo.id,'agent');
   for(const [pathname,code] of [['/change','PASSWORD_CHANGE_FORBIDDEN'],['/unsafe','ORIGIN_NOT_ALLOWED']]){
     const forbidden=await discover(pathname);const observed=await controller.observe(forbidden.id,'agent');
@@ -294,7 +294,7 @@ test('adaptive browser binds live fields, completes password/TOTP, verifies acco
   await assert.rejects(controller.prepareAuthentication(passkey.id,'agent',{revision:passkeyObservation.revision,method:'password'}),{code:'METHOD_MISMATCH'});
   const passkeyRequest=await controller.prepareAuthentication(passkey.id,'agent',{revision:passkeyObservation.revision,method:'passkey',bindings:{submit:passkeyObservation.elements.find(item=>item.role==='button').handle}});
   let signing=0;
-  assert.deepEqual(await controller.withAuthenticationLease(passkeyRequest,sink=>sink({passkey:async()=>{signing++;return {completed:true,method:'passkey'};}})),{status:'authenticated'});
+  assert.deepEqual(await controller.withAuthenticationLease(passkeyRequest,sink=>sink({passkey:async()=>{signing++;return {completed:true,method:'passkey'};}})),{status:'authenticated',credentialsSupplied:true});
   assert.equal(signing,1);assert.equal((await controller.exportSession(passkey.id,'agent')).origin,origin);
   // Keep an unused preconnection alive through teardown. Without explicitly
   // closing fixture connections, the after hook would wait indefinitely.

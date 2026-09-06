@@ -195,3 +195,12 @@ test('oversized mutation results commit a bounded uncertain response without rep
   assert.equal(calls, 1);
   assert.equal(f.reply(command.id).result.reason, 'response-capacity');
 });
+
+test('relay rejection codes round-trip without exception text', async () => {
+  const f = transportFixture();
+  const executor = createRelayExecutor({ identity: f.executorIdentity, getPeers: async () => [f.peer], store: f.store, io: f.io, now: f.now,
+    dispatch: async () => { throw Object.assign(new Error('SECRET-SENTINEL'), { code: 'SESSION_CLOSED' }); } });
+  const caller = createRelayCaller({ identity: f.agent, peer: f.executorPeer, io: f.io, now: f.now, sleep: async ms => { await executor.poll(); await executor.drain(); f.advance(ms); } });
+  await assert.rejects(caller.call('browser.observe'), { code: 'SESSION_CLOSED', message: 'Authentication operation rejected (SESSION_CLOSED)' });
+  assert(!JSON.stringify(f.state).includes('SECRET-SENTINEL'));
+});

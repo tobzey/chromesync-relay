@@ -40,11 +40,14 @@ export function createRelayCaller({ identity, peer, io = DEFAULT_IO, now = Date.
             const { value } = openMessage(blob, identity, peer.identity, { now: now() });
             if (value.type !== 'response' || value.replyTo !== id) throw new Error('Response binding failed');
             await io.delete({ ...peer.channel, name: responseName }).catch(() => {});
-            if (!value.ok) throw new Error('Authentication operation rejected');
+            if (!value.ok) {
+              const code = typeof value.code === 'string' && /^[A-Z_]{1,40}$/.test(value.code) ? value.code : 'OPERATION_REJECTED';
+              throw Object.assign(new Error(`Authentication operation rejected (${code})`), { code, operationRejected: true });
+            }
             return value.result;
           } catch (error) {
             if (error.status && ![404, 429, 503].includes(error.status)) throw error;
-            if (!error.status && error.message === 'Authentication operation rejected') throw error;
+            if (!error.status && error.operationRejected === true) throw error;
             if (error.status !== 404) pause = Math.min(5000, pause * 2);
           }
           await sleep(pause, undefined, { signal });
@@ -138,7 +141,7 @@ export function createRelayExecutor({ identity, getPeers, store, dispatch, isRea
               const current = (await getPeers()).find(p => p.enabled && p.identity.id === peer.identity.id);
               if (!current) throw new Error('Peer revoked');
               outcome = { ok: true, result: await dispatch(value.operation, value.args, current.identity) };
-            } catch { outcome = { ok: false }; }
+            } catch (error) { outcome = { ok: false, code: typeof error?.code === 'string' && /^[A-Z_]{1,40}$/.test(error.code) ? error.code : 'OPERATION_REJECTED' }; }
           }
           const encode = (result) => sealMessage({ type: 'response', replyTo: header.id, ...result }, identity, peer.identity, { now: now() }).toString('base64url');
           const oversized = () => ({ ok: true, result: { status: readOnly ? 'failed' : 'uncertain', reason: 'response-capacity', commandId: header.id } });

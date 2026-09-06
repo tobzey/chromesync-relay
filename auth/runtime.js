@@ -100,7 +100,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
     })]); } finally { clearTimeout(timer); }
   };
   const assertRequester = async requesterId => {
-    if (closing || Object.hasOwn((await store.read()).revokedRequesters ?? {}, requesterId)) throw new Error('Requester unavailable');
+    if (closing || Object.hasOwn((await store.read()).revokedRequesters ?? {}, requesterId)) throw Object.assign(new Error('Requester unavailable'), { code: 'REQUESTER_REVOKED' });
   };
   const changingProviders = new Set();
   const providerSummary = (id, record) => ({ id,
@@ -169,7 +169,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
                 originMatch: fragment.matchedOrigin === true, accountVerificationRequired: method === 'passkey' },
               ...(method === 'passkey' ? { passkey: { receiverUrl: `${snapshot.origin}/` } } : {}),
             });
-            if (updatingServices.has(serviceId) || blockedServices.has(serviceId)) throw new Error('Service enrollment unavailable');
+            if (updatingServices.has(serviceId) || blockedServices.has(serviceId)) throw Object.assign(new Error('Service enrollment unavailable'), { code: 'ENROLLMENT_UNAVAILABLE' });
             selectedService = serviceId;
             updatingServices.add(serviceId);
             controller.validateService?.({ ...enrollment, id: serviceId });
@@ -218,7 +218,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
             discoverySessions.set(result.id, { ownerId: principal.id, url: args.url, method });
             return result;
           }
-          if (updatingServices.has(args.serviceId) || blockedServices.has(args.serviceId)) throw new Error('Service enrollment unavailable');
+          if (updatingServices.has(args.serviceId) || blockedServices.has(args.serviceId)) throw Object.assign(new Error('Service enrollment unavailable'), { code: 'ENROLLMENT_UNAVAILABLE' });
           return controller.openSession(args.serviceId, principal.id);
         }
         case 'browser.observe': return controller.observe(args.sessionId, principal.id);
@@ -233,7 +233,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
         }
         case 'auth.request': {
           const serviceId = args.serviceId ?? (await controller.inspectSession(args.sessionId, principal.id)).serviceId;
-          if (updatingServices.has(serviceId) || blockedServices.has(serviceId)) throw new Error('Service enrollment unavailable');
+          if (updatingServices.has(serviceId) || blockedServices.has(serviceId)) throw Object.assign(new Error('Service enrollment unavailable'), { code: 'ENROLLMENT_UNAVAILABLE' });
           const enrollment = (await store.read()).enrollments.find(item => item.serviceId === serviceId);
           if (enrollment?.authentication?.mode === 'adaptive') {
             await controller.prepareAuthentication(args.sessionId, principal.id, { revision: args.revision,
@@ -243,7 +243,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
         }
         case 'browser.export': {
           const state = await store.read();
-          if (Object.hasOwn(state.revokedRequesters ?? {}, principal.id)) throw new Error('Requester revoked');
+          if (Object.hasOwn(state.revokedRequesters ?? {}, principal.id)) throw Object.assign(new Error('Requester revoked'), { code: 'REQUESTER_REVOKED' });
           const latest = rows => rows.map((row, index) => ({ row, index })).filter(({ row }) => row.sessionId === args.sessionId && row.requesterId === principal.id)
             .sort((a, b) => b.row.createdAt - a.row.createdAt || b.index - a.index)[0]?.row;
           const successful = latest(state.requests);
@@ -266,7 +266,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
     if (!['approver', 'executor'].includes(principal.role)) throw new Error('Unknown authentication role');
     const takeover = () => {
       const entry = takeovers.get(args.takeoverId);
-      if (!entry || entry.approverId !== principal.id) throw new Error('Takeover unavailable');
+      if (!entry || entry.approverId !== principal.id) throw Object.assign(new Error('Takeover unavailable'), { code: 'TAKEOVER_NOT_FOUND' });
       return entry;
     };
     const receiver = async () => {
@@ -293,7 +293,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
         const enrollment = validateEnrollment(args.enrollment);
         controller.validateService?.({ ...enrollment, id: enrollment.serviceId });
         const id = enrollment.serviceId;
-        if (updatingServices.has(id)) throw new Error('Service enrollment already changing');
+        if (updatingServices.has(id)) throw Object.assign(new Error('Service enrollment already changing'), { code: 'ENROLLMENT_UNAVAILABLE' });
         updatingServices.add(id); blockedServices.add(id);
         try {
           // Remove the old browser projection before committing the new account
@@ -310,7 +310,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
           // configuration; an explicit successful retry/restart rehydrates it.
           try { await controller.removeService(id); }
           catch { closing = true; await broker.drain({ abort: true }); await controller.close().catch(() => {}); }
-          throw new Error('Service enrollment unavailable');
+          throw Object.assign(new Error('Service enrollment unavailable'), { code: 'ENROLLMENT_UNAVAILABLE' });
         } finally { updatingServices.delete(id); }
       }
       case 'provider.put': {
@@ -386,7 +386,7 @@ export async function createAuthExecutor({ home, controller: suppliedController,
         for (const [id, entry] of takeovers) {
           if (entry.expiresAt <= Date.now()) takeovers.delete(id);
           else if (entry.sessionId === request.sessionId) {
-            if (entry.approverId !== principal.id) throw new Error('Another approver controls this browser');
+            if (entry.approverId !== principal.id) throw Object.assign(new Error('Another approver controls this browser'), { code: 'SESSION_BUSY' });
             return entry.view;
           }
         }
