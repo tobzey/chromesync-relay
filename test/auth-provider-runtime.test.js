@@ -22,7 +22,8 @@ async function fixture(t, { initial = TOKEN, catalogTimeoutMs = 20000 } = {}) {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'chromesync-provider-runtime-'));
   const secrets = { identity: createIdentity('executor'), providers: initial ? { default: { token: initial, discoveryEnabled: true } } : {}, peers: [] };
   const owner = createIdentity('approver'), agent = createIdentity('agent');
-  const store = createEncryptedStore({ path: path.join(home, 'state.enc'), key: randomBytes(32) });
+  const backingStore = createEncryptedStore({ path: path.join(home, 'state.enc'), key: randomBytes(32) });
+  const store = { read: () => backingStore.read(), mutate: fn => { if (control.failMutations) throw new Error(PRIVATE); return backingStore.mutate(fn); } };
   const calls = { saves: 0, clients: [], lists: 0, values: 0 };
   const control = { sdkMissing: false, itemsFail: false, persistFail: false, corruptSave: false, gate: null, savedGate: null };
   const provider = createOnePasswordProvider({ loadToken: async id => secrets.providers[id]?.token, loadSdk: async () => {
@@ -58,7 +59,7 @@ async function fixture(t, { initial = TOKEN, catalogTimeoutMs = 20000 } = {}) {
     persistProvider: async (id, token, { discoveryEnabled }) => {
       calls.saves++;
       if (control.persistFail) throw new Error(PRIVATE);
-      secrets.providers[id] = { token: control.corruptSave ? token.slice(0, 20) : token, discoveryEnabled };
+      secrets.providers[id] = { ...(token === undefined ? {} : { token: control.corruptSave ? token.slice(0, 20) : token }), discoveryEnabled };
       if (control.savedGate) await control.savedGate;
     },
   });
@@ -218,4 +219,73 @@ test('real inbox and encrypted relay carry a full-length token privately, then a
     assert.equal(result.items[0].label, 'Synthetic Socialhood login'); assert.equal(f.calls.values, 0);
     safe({ connected, result, state: await f.runtime.store.read(), encryptedMessages: [...f.entries.values()].map(buffer => buffer.toString()) });
   } finally { clearInterval(timer); await inbox.close(); }
+});
+
+async function removableAccount(f) {
+  const enrollment = { serviceId: 'synthetic-service', name: 'Synthetic account', accountId: 'synthetic-account', provider: 'onepassword', providerId: 'default', origins: ['https://example.test'], factors: ['password'], vaultId: 'syntheticvault', itemId: 'syntheticitem', fields: { password: { id: 'password' } } };
+  const session = { id: 'synthetic-session', ownerId: f.agent.id, serviceId: enrollment.serviceId, origin: enrollment.origins[0], purpose: 'login', revision: 1, flowId: 'login' };
+  f.runtime.controller.inspectSession = async () => session;
+  f.runtime.controller.withAuthenticationLease = async (_session, work) => work(async () => ({ status: 'authenticated' }));
+  await f.runtime.broker.putEnrollment(enrollment, f.owner.id);
+  const request = await f.runtime.broker.request({ sessionId: session.id, serviceId: enrollment.serviceId, factors: ['password'] }, f.agent.id);
+  await f.runtime.broker.decide(request.requestId, { decision: 'always' }, f.owner.id);
+  return { enrollment, session, request };
+}
+
+test('removing a provider drops its token and retires policies, requests, enrollments and browser services', async t => {
+  const f = await fixture(t), removed = [];
+  f.runtime.controller.removeService = async id => removed.push(id);
+  const { enrollment, session, request } = await removableAccount(f);
+  const result = await f.dispatch('provider.remove', { providerId: 'default' });
+  assert.equal(result.status, 'removed'); assert.equal(result.provider.hasCredential, false);
+  assert.deepEqual(f.secrets.providers.default, { discoveryEnabled: false });
+  const state = await f.runtime.store.read();
+  assert.equal(state.enrollments.length, 0); assert(state.policies.every(row => row.revokedAt));
+  assert.equal(state.requests.find(row => row.id === request.requestId).reason, 'provider-removed');
+  assert.deepEqual(removed, [enrollment.serviceId]);
+  const search = await f.search(); assert.equal(search.status, 'needs-user'); assert.match(search.reason, /^catalog-/);
+  await assert.rejects(f.dispatch('accounts.select', { sessionId: session.id, itemHandle: 'stale-handle' }, f.agent), /Open a fresh discovery browser/);
+  assert.equal((await f.dispatch('provider.put', { providerId: 'default', token: TOKEN })).status, 'configured');
+  await f.runtime.broker.putEnrollment(enrollment, f.owner.id);
+  assert.equal((await f.runtime.store.read()).enrollments[0].version, 1);
+  const next = await f.runtime.broker.request({ sessionId: session.id, serviceId: enrollment.serviceId, factors: ['password'] }, f.agent.id);
+  assert.equal(next.status, 'pending', 'readding the same provider and enrollment does not restore a standing grant');
+  safe(result);
+});
+
+test('provider removal refuses in-flight catalog work', async t => {
+  const f = await fixture(t); let release;
+  f.control.gate = new Promise(resolve => { release = resolve; });
+  const search = f.search();
+  while (!f.calls.clients.length) await delay(5);
+  const result = await f.dispatch('provider.remove', { providerId: 'default' });
+  assert.equal(result.status, 'failed'); assert.equal(result.reason, 'busy');
+  assert.equal(f.secrets.providers.default.token, TOKEN);
+  release(); await search;
+});
+
+test('cleanup failure keeps credentials dropped and stale grants cannot return through replacement', async t => {
+  const f = await fixture(t); await removableAccount(f);
+  f.runtime.controller.removeService = async () => { throw new Error(PRIVATE); };
+  const result = await f.dispatch('provider.remove', { providerId: 'default' });
+  assert.equal(result.reason, 'provider-cleanup-incomplete');
+  assert.equal(f.secrets.providers.default.token, undefined);
+  assert((await f.runtime.store.read()).policies.every(row => row.revokedAt));
+  assert.equal((await f.dispatch('provider.put', { token: TOKEN })).status, 'configured');
+  assert((await f.runtime.store.read()).policies.every(row => row.revokedAt));
+  safe(result);
+});
+
+test('a failed durable retirement blocks token replacement until old grants are revoked', async t => {
+  const f = await fixture(t); await removableAccount(f);
+  f.runtime.controller.removeService = async () => {};
+  f.control.failMutations = true;
+  assert.equal((await f.dispatch('provider.remove', { providerId: 'default' })).reason, 'provider-cleanup-incomplete');
+  assert.equal(f.secrets.providers.default.token, undefined);
+  assert.equal((await f.dispatch('provider.put', { token: TOKEN })).status, 'failed');
+  assert.equal(f.secrets.providers.default.token, undefined);
+  f.control.failMutations = false;
+  assert.equal((await f.dispatch('provider.put', { token: TOKEN })).status, 'configured');
+  assert.equal((await f.runtime.store.read()).enrollments.length, 0);
+  assert((await f.runtime.store.read()).policies.every(row => row.revokedAt));
 });

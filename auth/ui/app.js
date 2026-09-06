@@ -185,7 +185,7 @@ function renderProviders() {
     card.append(element('h3', provider.id), element('p', provider.hasCredential ? 'Credential stored on the executor.' : 'No credential is stored for this connection.'),
       element('strong', provider.health.status === 'ready' ? 'Connection verified' : provider.health.status === 'error' ? 'Connection needs attention' : provider.health.status === 'checking' ? 'Checking connection' : 'Connection not yet checked'),
       element('p', provider.health.message || (provider.health.status === 'ready' ? 'Authentication and vault metadata access were verified.' : provider.health.status === 'checking' ? 'The executor is checking authentication and vault metadata access.' : 'Connection health has not been checked.')),
-      element('p', provider.discoveryEnabled ? 'Account discovery is enabled.' : 'Account discovery is disabled.'));
+      element('p', provider.discoveryEnabled ? 'Account discovery is enabled.' : 'Account discovery is disabled. Existing accounts and saved permissions can still use the stored credential until this connection is removed.'));
     const details = [];
     if (provider.health.code) details.push(`Status: ${provider.health.code}`);
     if (provider.health.checkedAt) details.push(`Checked ${new Date(provider.health.checkedAt).toLocaleString()}`);
@@ -198,10 +198,15 @@ function renderProviders() {
     for (const [label, operation, args] of [
       ['Check connection', 'provider.check', { providerId: provider.id }],
       [provider.discoveryEnabled ? 'Disable account discovery' : 'Enable account discovery', 'provider.discovery', { providerId: provider.id, enabled: !provider.discoveryEnabled }],
+      ['Remove connection', 'provider.remove', { providerId: provider.id }],
     ]) {
-      const button = element('button', label); button.disabled = !provider.hasCredential || providerActions.has(provider.id);
-      button.addEventListener('click', () => changeProvider(provider.id, operation, args)); actions.append(button);
+      const button = element('button', label); button.disabled = (operation !== 'provider.remove' && !provider.hasCredential) || providerActions.has(provider.id);
+      button.addEventListener('click', () => {
+        if (operation === 'provider.remove' && !confirm('Remove this connection? Saved permissions and selected accounts for this connection will be revoked.')) return;
+        return changeProvider(provider.id, operation, args);
+      }); actions.append(button);
     }
+    if (!provider.hasCredential) actions.append(action('Connect', () => { const form = $('#provider-form'); form.elements.providerId.value = provider.id; form.elements.token.focus(); }));
     card.append(actions); list.append(card);
   }
 }
@@ -234,7 +239,7 @@ async function refreshProviders() {
 async function changeProvider(id, operation, args) {
   if (providerActions.has(id)) return;
   providerActions.add(id); providerRevision++; renderProviders();
-  providerStatus(operation === 'provider.check' ? 'Checking the saved credential and account catalog…' : 'Updating account discovery…', 'loading');
+  providerStatus(operation === 'provider.check' ? 'Checking the saved credential and account catalog…' : operation === 'provider.remove' ? 'Removing the connection and revoking saved permissions…' : 'Updating account discovery…', 'loading');
   try {
     const result = await call(operation, args, { timeoutMs: 95000, allowFailed: true });
     if (result?.status === 'failed') {

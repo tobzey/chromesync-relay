@@ -825,6 +825,26 @@ function invalidatePolicy(state, policy, time, approverId) {
       return pageItems((await store.read()).enrollments, options, 'enrollments', (row) => row.serviceId);
     },
 
+    async retireProvider(providerId, approverId) {
+      await initialize();
+      const retired = await store.mutate(state => {
+        const serviceIds = state.enrollments.filter(row => (row.providerId || 'default') === providerId).map(row => row.serviceId);
+        const ids = new Set(serviceIds), requestIds = [];
+        for (const policy of state.policies) if (ids.has(policy.serviceId) && policy.revokedAt == null) {
+          policy.revokedAt = now(); policy.revokedBy = approverId;
+          audit(state, 'policy-revoked', null, now(), approverId, { policyId: policy.id, reason: 'provider-removed' });
+        }
+        for (const row of state.requests) if (ids.has(row.serviceId) && needsAttention(row)) {
+          requestIds.push(row.id); setState(state, row, 'cancelled', 'provider-removed', now(), approverId);
+        }
+        state.enrollments = state.enrollments.filter(row => !ids.has(row.serviceId));
+        return { serviceIds, requestIds };
+      });
+      abortRequests(retired.requestIds);
+      await Promise.allSettled(retired.requestIds.map(id => running.get(id)).filter(Boolean));
+      return retired.serviceIds;
+    },
+
     async resume() {
       await initialize();
       const state = await store.read();

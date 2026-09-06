@@ -331,6 +331,15 @@ export async function createAuthExecutor({ home, controller: suppliedController,
           // cannot replace the saved credential or activate a client later.
           const candidate = await boundedCatalog(`provider:${id}`, () => providers.onepassword.prepareConnection(args.token));
           await assertRequester(principal.id);
+          const previous = (await getSecrets()).providers[id];
+          if (previous && !previous.token) {
+            const retired = await broker.retireProvider(id, principal.id);
+            const cleanup = await Promise.allSettled(retired.flatMap(serviceId => [
+              Promise.resolve().then(() => controller.removeService(serviceId)),
+              Promise.resolve().then(() => passkeys?.releaseService(serviceId)),
+            ]));
+            if (cleanup.some(result => result.status === 'rejected')) throw new Error('Provider cleanup incomplete');
+          }
           stage = 'storage';
           const enabled = args.discoveryEnabled !== false;
           if (persistProvider) await persistProvider(id, args.token, { discoveryEnabled: enabled });
@@ -364,6 +373,35 @@ export async function createAuthExecutor({ home, controller: suppliedController,
           return { status: 'checked', providerId: id, provider: providerSummary(id, record) };
         } catch (error) { return providerFailure(id, error); }
         finally { changingProviders.delete(id); }
+      }
+      case 'provider.remove': {
+        const id = checkName(args.providerId || 'default');
+        if (changingProviders.has(id) || catalogWork.size) return providerFailure(id, { code: 'capacity' });
+        changingProviders.add(id);
+        let dropped = false;
+        try {
+          // Drop the credential durably before retiring grants or browser state.
+          if (persistProvider) await persistProvider(id, undefined, { discoveryEnabled: false });
+          else await updateAuthSecrets(home, async record => {
+            await assertRequester(principal.id);
+            record.providers[id] = { discoveryEnabled: false };
+          });
+          const record = (await getSecrets()).providers[id];
+          if (!record || record.token || record.discoveryEnabled !== false) throw new Error('Credential removal unconfirmed');
+          dropped = true;
+          discoveryEpoch++; providers.onepassword.reset(id);
+          const services = await broker.retireProvider(id, principal.id);
+          const cleanup = await Promise.allSettled(services.flatMap(serviceId => [
+            Promise.resolve().then(() => controller.removeService(serviceId)),
+            Promise.resolve().then(() => passkeys?.releaseService(serviceId)),
+          ]));
+          if (cleanup.some(result => result.status === 'rejected')) throw new Error('Provider cleanup incomplete');
+          return { status: 'removed', providerId: id, provider: providerSummary(id, record) };
+        } catch {
+          discoveryEpoch++; providers.onepassword?.reset?.(id);
+          const record = (await getSecrets()).providers[id];
+          return { status: 'failed', reason: dropped || (record && !record.token) ? 'provider-cleanup-incomplete' : 'provider-removal-unconfirmed', provider: providerSummary(id, record) };
+        } finally { changingProviders.delete(id); }
       }
       case 'provider.discovery': {
         const id = checkName(args.providerId || 'default');
