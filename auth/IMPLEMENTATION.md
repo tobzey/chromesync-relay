@@ -1,5 +1,14 @@
 # Authentication implementation and completion evidence
 
+## Acceptance baseline on 2026-09-06 (WP0)
+
+At base `12e7750`, both locked dependency installs completed with lifecycle scripts disabled. Node 22.23.2 and Chrome for Testing 152.0.7977.82 (mac-arm64) were used; the archive SHA-256 matched the authentication workflow pin. The browser was installed outside the repository in the user's ChromeSync testing cache.
+
+- `npm run test:auth`: 171 tests, 161 passed, 0 failed, 10 skipped; 20603.181583 ms.
+- `node scripts/test-auth-e2e.mjs`: 171 tests, 171 passed, 0 failed, 0 skipped; 120336.369541 ms.
+- The initial sandboxed fast run could not bind local lock ports (132 passed, 29 failed, 10 skipped); the permitted rerun above resolved that environment restriction.
+- Origin has no matching feature branch; the requested fast-forward pull was attempted and the specified base retained.
+
 The requested outcome is an agent browser that can request login or sensitive reauthentication, obtain a one-time or persistent human decision through the relay, and continue without receiving passwords, OTPs, passkey keys or unrestricted vault access. A persistent policy must support an offline daily driver when an independently authorized executor is online. Passwords, TOTP and existing 1Password passkeys are in scope; a phone approval client is a future delivery surface for the same protocol.
 
 Implementation and synthetic integration verification are complete. Live deployment/provider acceptance remains open; this file deliberately keeps those gates unchecked.
